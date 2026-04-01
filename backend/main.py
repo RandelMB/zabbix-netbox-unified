@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import ipaddress
 import shlex
 import sqlite3
 from pathlib import Path
@@ -239,6 +240,14 @@ def observium_exec(args: list[str]) -> dict[str, Any]:
     if result.exit_code != 0:
         raise HTTPException(400, f"Observium command failed: {output}")
     return {"command": args, "output": output}
+
+
+def is_ip_address(value: str) -> bool:
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except Exception:
+        return False
 
 
 def log_export(
@@ -971,10 +980,12 @@ async def netbox_delete_interface(iface_id: int):
 
 
 @app.get("/api/netbox/ips")
-async def netbox_ips(device_id: Optional[int] = None, limit: int = 200):
+async def netbox_ips(device_id: Optional[int] = None, address: Optional[str] = None, limit: int = 200):
     params: dict[str, Any] = {"limit": limit}
     if device_id:
         params["device_id"] = device_id
+    if address:
+        params["address"] = address
     return await netbox_request("GET", "/ipam/ip-addresses/", params)
 
 
@@ -1083,7 +1094,7 @@ async def observium_update_device(device_id: int, body: dict[str, Any]):
 
     rename_result = None
     if "hostname" in body and body["hostname"] and body["hostname"] != current["hostname"]:
-        rename_result = observium_exec(["php", "/opt/observium/rename_device.php", current["hostname"], body["hostname"]])
+        rename_result = observium_exec(["php", "/opt/observium/rename_device.php", "-p", current["hostname"], body["hostname"]])
 
     allowed_fields = {
         "label", "ip", "snmp_version", "snmp_community", "snmp_port", "snmp_transport",
@@ -1107,6 +1118,17 @@ async def observium_update_device(device_id: int, body: dict[str, Any]):
         observium_db_query(f"UPDATE devices SET {', '.join(updates)} WHERE device_id = %s", tuple(params), fetch="none")
 
     updated = observium_db_query("SELECT * FROM devices WHERE device_id = %s", (device_id,), fetch="one")
+    hostname_changed = bool(body.get("hostname") and body["hostname"] != current["hostname"])
+    if hostname_changed and updated and updated["hostname"] == current["hostname"] and not is_ip_address(str(body["hostname"])):
+        updates = []
+        params = []
+        if not body.get("label"):
+            updates.append("`label` = %s")
+            params.append(body["hostname"])
+        if updates:
+            params.append(device_id)
+            observium_db_query(f"UPDATE devices SET {', '.join(updates)} WHERE device_id = %s", tuple(params), fetch="none")
+            updated = observium_db_query("SELECT * FROM devices WHERE device_id = %s", (device_id,), fetch="one")
     return {"status": "ok", "rename_result": rename_result, "result": normalize_observium_device(updated)}
 
 

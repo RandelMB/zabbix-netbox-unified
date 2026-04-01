@@ -194,7 +194,7 @@ export function ObserviumEditor({ deviceId, onDataReady }) {
           <div>
             <div className="grid-2">
               <div className="field-row">
-                <label>Hostname</label>
+                <label>Hostname / Poll Target</label>
                 <input value={device.hostname || ""} onChange={e => updateField("hostname", e.target.value)} />
               </div>
               <div className="field-row">
@@ -202,7 +202,7 @@ export function ObserviumEditor({ deviceId, onDataReady }) {
                 <input value={device.ip || ""} onChange={e => updateField("ip", e.target.value)} />
               </div>
               <div className="field-row">
-                <label>Label</label>
+                <label>Display Label</label>
                 <input value={device.label || ""} onChange={e => updateField("label", e.target.value)} />
               </div>
               <div className="field-row">
@@ -223,6 +223,12 @@ export function ObserviumEditor({ deviceId, onDataReady }) {
                 </select>
               </div>
             </div>
+
+            {!isCreateMode && (
+              <div className="notice notice-info" style={{ marginTop: 12 }}>
+                In Observium, hostname is the polling target. If you want a friendly display name without changing the SNMP target, use Display Label.
+              </div>
+            )}
 
             {!isCreateMode && (
               <div className="grid-2" style={{ marginTop: 8 }}>

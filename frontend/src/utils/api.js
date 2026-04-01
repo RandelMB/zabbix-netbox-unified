@@ -1,5 +1,19 @@
 const BASE = process.env.REACT_APP_API_URL || "";
 
+function formatErrorDetail(detail) {
+  if (!detail) return "";
+  if (typeof detail === "string") return detail;
+  if (Array.isArray(detail)) {
+    return detail.map(item => formatErrorDetail(item)).filter(Boolean).join(" | ");
+  }
+  if (typeof detail === "object") {
+    if (typeof detail.msg === "string") return detail.msg;
+    if (typeof detail.detail === "string") return detail.detail;
+    return JSON.stringify(detail);
+  }
+  return String(detail);
+}
+
 async function req(method, path, body) {
   const opts = {
     method,
@@ -8,7 +22,10 @@ async function req(method, path, body) {
   if (body) opts.body = JSON.stringify(body);
   const r = await fetch(`${BASE}${path}`, opts);
   const data = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(data.detail || JSON.stringify(data));
+  if (!r.ok) {
+    const message = formatErrorDetail(data.detail) || formatErrorDetail(data) || `${method} ${path} failed with status ${r.status}`;
+    throw new Error(message);
+  }
   return data;
 }
 
@@ -48,7 +65,12 @@ export const api = {
   netboxUpdateInterface: (id, b) => req("PATCH", `/api/netbox/interfaces/${id}`, b),
   netboxCreateInterface: (b) => req("POST", "/api/netbox/interfaces", b),
   netboxDeleteInterface: (id) => req("DELETE", `/api/netbox/interfaces/${id}`),
-  netboxIPs: (deviceId) => req("GET", `/api/netbox/ips?device_id=${deviceId}&limit=200`),
+  netboxIPs: (deviceId, address = "") => {
+    const params = new URLSearchParams({ limit: "200" });
+    if (deviceId !== undefined && deviceId !== null && String(deviceId) !== "") params.set("device_id", String(deviceId));
+    if (address) params.set("address", address);
+    return req("GET", `/api/netbox/ips?${params.toString()}`);
+  },
   netboxCreateIP: (b) => req("POST", "/api/netbox/ips", b),
   netboxUpdateIP: (id, b) => req("PATCH", `/api/netbox/ips/${id}`, b),
   netboxDeleteIP: (id) => req("DELETE", `/api/netbox/ips/${id}`),

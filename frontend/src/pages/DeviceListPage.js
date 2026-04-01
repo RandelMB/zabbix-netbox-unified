@@ -88,7 +88,7 @@ export function DeviceListPage({ onOpenDevice }) {
       return;
     }
     try {
-      const response = await api.exportZabbixToObservium({ hostids, run_discovery: true, run_poller: true, update_existing: true });
+      const response = await api.exportZabbixToObservium({ hostids, run_discovery: false, run_poller: false, update_existing: true });
       const created = response.result.filter(item => item.status === "created").length;
       const updated = response.result.filter(item => item.status === "updated").length;
       const skipped = response.result.filter(item => item.status === "skipped").length;
@@ -237,6 +237,7 @@ export function DeviceListPage({ onOpenDevice }) {
               <span style={{ color: "var(--text3)", fontFamily: "var(--font-mono)", fontSize: 11 }}>{filteredN.length} / {nbDevices.length} devices</span>
               {archiveSelector("netbox")}
               <input placeholder="Filter..." value={filter.netbox} onChange={event => setFilter(prev => ({ ...prev, netbox: event.target.value }))} style={{ marginLeft: "auto", width: 140, padding: "4px 10px" }} />
+              <button className="btn-secondary" style={{ padding: "4px 10px", fontSize: 10 }} onClick={() => onOpenDevice({ type: "netbox", id: "new", label: "New NetBox Device" })}>+ New</button>
             </div>
             <div className="section" style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column" }}>
               <div style={{ overflow: "auto", flex: 1 }}>

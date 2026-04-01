@@ -242,7 +242,7 @@ export function TransferPanel({ zabbixData, netboxData, observiumData }) {
         onConfirm: async () => {
           setSaving(true);
           try {
-            const result = await api.exportZabbixToObservium({ hostids: [zabbixData.hostid], run_discovery: true, run_poller: true, update_existing: true });
+            const result = await api.exportZabbixToObservium({ hostids: [zabbixData.hostid], run_discovery: false, run_poller: false, update_existing: true });
             addLog("ok", `Exported to Observium: ${zabbixData.host}`, result);
             setConfirm(null);
           } catch (error) {

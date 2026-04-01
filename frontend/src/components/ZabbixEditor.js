@@ -260,10 +260,10 @@ export function ZabbixEditor({ hostId, onDataReady }) {
       status: host.status,
       description: host.description,
     };
-    if (host.groups) payload.groups = host.groups.map(group => ({ groupid: group.groupid }));
-    if (host.inventory) payload.inventory = host.inventory;
-    if (host.tags) payload.tags = host.tags;
-    if (host.macros) payload.macros = host.macros;
+    if (Array.isArray(host.groups) && host.groups.length > 0) payload.groups = host.groups.map(group => ({ groupid: group.groupid }));
+    if (host.inventory && Object.keys(host.inventory).length > 0) payload.inventory = host.inventory;
+    if (Array.isArray(host.tags) && host.tags.length > 0) payload.tags = host.tags;
+    if (Array.isArray(host.macros) && host.macros.length > 0) payload.macros = host.macros;
     return payload;
   }
 
