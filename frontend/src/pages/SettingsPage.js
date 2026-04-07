@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { api } from "../utils/api";
 import { useLogs } from "../hooks/useLogs";
 
-export function SettingsPage() {
+export function SettingsPage({ uiPrefs, onUiPrefsChange, themePresets }) {
   const { addLog } = useLogs();
   const [creds, setCreds] = useState({
     zabbix_url: "",
@@ -127,6 +127,40 @@ export function SettingsPage() {
         <button className="btn-primary" onClick={saveCreds}>Save Credentials</button>
         <button className="btn-secondary" onClick={checkAll} disabled={checking}>{checking ? "Checking..." : "Test Connections"}</button>
         <button className="btn-secondary" onClick={reloadExportLogs}>Reload Export Logs</button>
+      </div>
+
+      <div className="section" style={{ marginBottom: 24 }}>
+        <div className="section-header"><span>Visual Filters</span></div>
+        <div className="section-body">
+          <div className="grid-3">
+            <div className="field-row">
+              <label>Theme Preset</label>
+              <select value={uiPrefs.theme} onChange={event => onUiPrefsChange(prev => ({ ...prev, theme: event.target.value }))}>
+                {Object.entries(themePresets).map(([key, value]) => (
+                  <option key={key} value={key}>{value.label}</option>
+                ))}
+              </select>
+            </div>
+            <div className="field-row">
+              <label>Correlation Highlight</label>
+              <select value={uiPrefs.correlationMode} onChange={event => onUiPrefsChange(prev => ({ ...prev, correlationMode: event.target.value }))}>
+                <option value="all">Saved + Auto</option>
+                <option value="saved">Saved Only</option>
+                <option value="off">Off</option>
+              </select>
+            </div>
+            <div className="field-row">
+              <label>Highlight Intensity</label>
+              <select value={uiPrefs.highlightIntensity} onChange={event => onUiPrefsChange(prev => ({ ...prev, highlightIntensity: event.target.value }))}>
+                <option value="strong">Strong</option>
+                <option value="subtle">Subtle</option>
+              </select>
+            </div>
+          </div>
+          <div className="notice notice-info" style={{ marginBottom: 0 }}>
+            Inventory now highlights saved correlation groups and automatic matches by IP/name based on the selected visual mode.
+          </div>
+        </div>
       </div>
 
       <div className="section" style={{ marginBottom: 24 }}>

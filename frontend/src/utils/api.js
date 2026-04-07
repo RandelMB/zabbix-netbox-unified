@@ -61,6 +61,7 @@ export const api = {
   netboxDevice: (id) => req("GET", `/api/netbox/devices/${id}`),
   netboxUpdateDevice: (id, b) => req("PATCH", `/api/netbox/devices/${id}`, b),
   netboxCreateDevice: (b) => req("POST", "/api/netbox/devices", b),
+  netboxSetPrimaryIP: (deviceId, b) => req("POST", `/api/netbox/devices/${deviceId}/primary-ip`, b),
   netboxDeviceInterfaces: (id) => req("GET", `/api/netbox/devices/${id}/interfaces`),
   netboxUpdateInterface: (id, b) => req("PATCH", `/api/netbox/interfaces/${id}`, b),
   netboxCreateInterface: (b) => req("POST", "/api/netbox/interfaces", b),

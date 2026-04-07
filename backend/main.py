@@ -954,6 +954,27 @@ async def netbox_update_device(device_id: int, body: dict[str, Any]):
     return await netbox_request("PATCH", f"/dcim/devices/{device_id}/", body)
 
 
+@app.post("/api/netbox/devices/{device_id}/primary-ip")
+async def netbox_set_primary_ip(device_id: int, body: dict[str, Any]):
+    ip_id = body.get("ip_id")
+    if ip_id in {None, ""}:
+        raise HTTPException(400, "ip_id is required")
+
+    ip_result = await netbox_request("GET", f"/ipam/ip-addresses/{int(ip_id)}/")
+    ip_payload = ip_result.get("result") or {}
+    address = str(ip_payload.get("address") or "").strip()
+    if not address:
+        raise HTTPException(400, "NetBox IP payload is missing address")
+
+    try:
+        ip_version = ipaddress.ip_interface(address).version
+    except ValueError as exc:
+        raise HTTPException(400, f"Invalid NetBox IP address: {address}") from exc
+
+    primary_field = "primary_ip4" if ip_version == 4 else "primary_ip6"
+    return await netbox_request("PATCH", f"/dcim/devices/{device_id}/", {primary_field: int(ip_id)})
+
+
 @app.get("/api/netbox/devices/{device_id}/interfaces")
 async def netbox_device_interfaces(device_id: int):
     return await netbox_request("GET", "/dcim/interfaces/", {"device_id": device_id, "limit": 200})

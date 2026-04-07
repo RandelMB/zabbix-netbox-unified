@@ -2,13 +2,12 @@ version: "3.9"
 
 services:
   backend:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
+    image: zabbix-netbox-unified-backend
     container_name: zneditor-backend
     env_file:
       - .env
     volumes:
+      - ./backend:/app
       - /var/run/docker.sock:/var/run/docker.sock
       - ./data:/app/data
     restart: unless-stopped

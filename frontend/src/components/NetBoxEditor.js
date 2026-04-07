@@ -241,6 +241,7 @@ export function NetBoxEditor({ deviceId, onDataReady }) {
       const normalized = normalizeIpAddress(payload.address);
       const preMatches = await lookupExistingIps(normalized);
       let existing = null;
+      let resolvedIpId = null;
       if (payload.existing_ip_id) {
         existing = preMatches.find(item => String(item.id) === String(payload.existing_ip_id)) || await attachExistingIpToInterface(payload.existing_ip_id, payload.assigned_object_id);
       } else if (preMatches.length > 0) {
@@ -266,10 +267,17 @@ export function NetBoxEditor({ deviceId, onDataReady }) {
           assigned_object_id: Number(payload.assigned_object_id),
           status: payload.status,
         });
+        resolvedIpId = existing.id;
         addLog("ok", `Existing IP assigned to interface: ${normalized}`);
       } else {
-        await api.netboxCreateIP({ ...payload, address: normalized });
+        const created = await api.netboxCreateIP({ ...payload, address: normalized });
+        resolvedIpId = created.result?.id || created.response?.id || null;
         addLog("ok", `IP created in NetBox: ${normalized}`);
+      }
+
+      if (resolvedIpId) {
+        await api.netboxSetPrimaryIP(activeDeviceId, { ip_id: Number(resolvedIpId) });
+        addLog("ok", `Primary IPv4 updated in NetBox: ${normalized}`);
       }
       setAddingIp(false);
       setNewIp({ address: "", status: "active", interface_id: "" });

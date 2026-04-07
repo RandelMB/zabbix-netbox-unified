@@ -22,22 +22,42 @@ export function WorkspacePage({ pendingTab, onPendingConsumed }) {
 
   useEffect(() => {
     if (pendingTab) {
-      addTab(pendingTab);
+      if (Array.isArray(pendingTab?.devices)) {
+        addTabs(pendingTab.devices);
+      } else {
+        addTabs([pendingTab]);
+      }
       onPendingConsumed && onPendingConsumed();
     }
   }, [pendingTab, onPendingConsumed]);
 
-  function addTab(device) {
-    const id = ++_tabCounter;
+  function addTabs(devices) {
+    const nextActive = {};
     setTabs(prev => {
-      const exists = prev.find(item => item.type === device.type && item.deviceId === device.id);
-      if (exists) {
-        setTimeout(() => setActiveByType(current => ({ ...current, [device.type]: exists.id })), 0);
-        return prev;
+      const next = [...prev];
+      for (const device of devices) {
+        if (!device?.type || device?.id === undefined || device?.id === null) continue;
+        const exists = next.find(item => item.type === device.type && item.deviceId === device.id);
+        if (exists) {
+          nextActive[device.type] = exists.id;
+          continue;
+        }
+        const id = ++_tabCounter;
+        next.push({ id, type: device.type, label: device.label, deviceId: device.id });
+        nextActive[device.type] = id;
       }
-      setTimeout(() => setActiveByType(current => ({ ...current, [device.type]: id })), 0);
-      return [...prev, { id, type: device.type, label: device.label, deviceId: device.id }];
+      return next;
     });
+    setTimeout(() => setActiveByType(current => ({ ...current, ...nextActive })), 0);
+  }
+
+  function openNewTab(type) {
+    const labels = {
+      zabbix: "New Zabbix SNMP Host",
+      netbox: "New NetBox Device",
+      observium: "New Observium Device",
+    };
+    addTabs([{ type, id: "new", label: labels[type] || "New Device" }]);
   }
 
   function closeTab(id) {
@@ -119,6 +139,13 @@ export function WorkspacePage({ pendingTab, onPendingConsumed }) {
               <div style={{ padding: "10px 12px", borderBottom: "1px solid var(--border)", background: "var(--bg2)", display: "flex", alignItems: "center", gap: 8 }}>
                 <span className={`tag ${PANEL_META[type].className}`} style={{ ...(PANEL_META[type].style || {}) }}>{PANEL_META[type].short}</span>
                 <strong style={{ fontSize: 12 }}>{PANEL_META[type].label}</strong>
+                <button
+                  className="btn-secondary"
+                  style={{ marginLeft: "auto", padding: "4px 10px", fontSize: 10 }}
+                  onClick={() => openNewTab(type)}
+                >
+                  + New
+                </button>
               </div>
               <div style={{ padding: "6px 8px", borderBottom: "1px solid var(--border)", background: "var(--bg3)", display: "flex", gap: 6, overflowX: "auto" }}>
                 {tabsByType[type].length === 0 && <span style={{ color: "var(--text3)", fontSize: 11 }}>No device loaded</span>}
