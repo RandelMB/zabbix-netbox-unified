@@ -495,33 +495,20 @@ export function ZabbixEditor({ hostId, onDataReady }) {
               </select>
             </div>
 
-            {isCreateMode ? (
-              <div className="field-row">
-                <label>Groups</label>
-                <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
-                  {groups.map(group => {
-                    const checked = (host.groups || []).some(item => String(item.groupid || item.id) === String(group.groupid));
-                    return (
-                      <label key={group.groupid} style={{ display: "flex", alignItems: "center", gap: 6, padding: "6px 10px", border: "1px solid var(--border)", borderRadius: "var(--radius)", cursor: "pointer" }}>
-                        <input type="checkbox" checked={checked} onChange={() => toggleGroup(group)} />
-                        <span>{group.name}</span>
-                      </label>
-                    );
-                  })}
-                </div>
+            <div className="field-row">
+              <label>Groups</label>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                {groups.map(group => {
+                  const checked = (host.groups || []).some(item => String(item.groupid || item.id) === String(group.groupid));
+                  return (
+                    <label key={group.groupid} style={{ display: "flex", alignItems: "center", gap: 6, padding: "6px 10px", border: checked ? "1px solid var(--accent)" : "1px solid var(--border)", borderRadius: "var(--radius)", cursor: "pointer", background: checked ? "rgba(0,212,170,0.08)" : "transparent" }}>
+                      <input type="checkbox" checked={checked} onChange={() => toggleGroup(group)} />
+                      <span>{group.name}</span>
+                    </label>
+                  );
+                })}
               </div>
-            ) : (
-              <div className="field-row">
-                <label>Groups</label>
-                <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
-                  {(host.groups || []).map(group => (
-                    <span key={group.groupid} className="badge" style={{ background: "var(--bg4)", color: "var(--text2)" }}>
-                      {group.name}
-                    </span>
-                  ))}
-                </div>
-              </div>
-            )}
+            </div>
           </div>
         )}
 

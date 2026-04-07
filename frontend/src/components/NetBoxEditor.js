@@ -158,7 +158,12 @@ export function NetBoxEditor({ deviceId, onDataReady }) {
       });
     } catch (e) {
       setEnrichment(null);
-      addLog("err", "NetBox enrichment load failed: " + errorMessage(e));
+      const message = errorMessage(e);
+      if (message.includes("No saved correlation exists for this NetBox device")) {
+        addLog("info", "NetBox enrichment unavailable: save a correlation first");
+      } else {
+        addLog("err", "NetBox enrichment load failed: " + message);
+      }
     }
     setEnrichmentLoading(false);
   }, [activeDeviceId, addLog, isCreateMode]);
@@ -392,6 +397,17 @@ export function NetBoxEditor({ deviceId, onDataReady }) {
   if (!device && !isCreateMode) return <div style={{ padding: 20, color: "var(--error)" }}>Device not found</div>;
 
   const statusVal = device.status?.value || device.status || "active";
+  const actionableFields = new Set((enrichment?.suggestions || []).map(item => item.field));
+  const fieldHighlightStyle = (field, currentValue) => {
+    const text = typeof currentValue === "string" ? currentValue.trim() : currentValue;
+    const isEmpty = currentValue === null || currentValue === undefined || text === "";
+    if (!actionableFields.has(field)) return undefined;
+    return {
+      borderColor: isEmpty ? "var(--warn)" : "var(--accent2)",
+      boxShadow: isEmpty ? "0 0 0 1px rgba(255,169,77,0.28)" : "0 0 0 1px rgba(0,153,255,0.22)",
+      background: isEmpty ? "rgba(255,169,77,0.08)" : "rgba(0,153,255,0.06)",
+    };
+  };
 
   return (
     <div style={{ height: "100%", display: "flex", flexDirection: "column" }}>
@@ -468,11 +484,11 @@ export function NetBoxEditor({ deviceId, onDataReady }) {
                   </div>
                   <div className="field-row">
                     <label>Asset Tag</label>
-                    <input value={device.asset_tag || ""} onChange={e => updateField("asset_tag", e.target.value)} />
+                    <input value={device.asset_tag || ""} onChange={e => updateField("asset_tag", e.target.value)} style={fieldHighlightStyle("asset_tag", device.asset_tag)} />
                   </div>
                   <div className="field-row">
                     <label>Serial</label>
-                    <input value={device.serial || ""} onChange={e => updateField("serial", e.target.value)} />
+                    <input value={device.serial || ""} onChange={e => updateField("serial", e.target.value)} style={fieldHighlightStyle("serial", device.serial)} />
                   </div>
                 </>
               ) : (
@@ -491,15 +507,15 @@ export function NetBoxEditor({ deviceId, onDataReady }) {
                   </div>
                   <div className="field-row">
                     <label>Primary IP</label>
-                    <input value={device.primary_ip4?.address || ""} disabled style={{ opacity: 0.6 }} />
+                    <input value={device.primary_ip4?.address || ""} disabled style={{ opacity: 0.6, ...(fieldHighlightStyle("primary_ip4", device.primary_ip4?.address) || {}) }} />
                   </div>
                   <div className="field-row">
                     <label>Asset Tag</label>
-                    <input value={device.asset_tag || ""} onChange={e => updateField("asset_tag", e.target.value)} />
+                    <input value={device.asset_tag || ""} onChange={e => updateField("asset_tag", e.target.value)} style={fieldHighlightStyle("asset_tag", device.asset_tag)} />
                   </div>
                   <div className="field-row">
                     <label>Serial</label>
-                    <input value={device.serial || ""} onChange={e => updateField("serial", e.target.value)} />
+                    <input value={device.serial || ""} onChange={e => updateField("serial", e.target.value)} style={fieldHighlightStyle("serial", device.serial)} />
                   </div>
                 </>
               )}
@@ -507,7 +523,7 @@ export function NetBoxEditor({ deviceId, onDataReady }) {
 
             <div className="field-row" style={{ marginTop: 12 }}>
               <label>Description</label>
-              <textarea value={device.description || ""} onChange={e => updateField("description", e.target.value)} style={{ height: 84, resize: "vertical" }} />
+              <textarea value={device.description || ""} onChange={e => updateField("description", e.target.value)} style={{ height: 84, resize: "vertical", ...(fieldHighlightStyle("description", device.description) || {}) }} />
             </div>
 
             {isCreateMode && (
@@ -697,27 +713,9 @@ export function NetBoxEditor({ deviceId, onDataReady }) {
 
         {tab === "Comments" && (
           <div>
-            <div className="section" style={{ marginBottom: 16 }}>
-              <div className="section-header"><span>Auto-build from IP</span></div>
-              <div className="section-body">
-                <div className="grid-2" style={{ marginBottom: 8 }}>
-                  <div className="field-row"><label>IP Address</label><input value={commentBuilder.ip} onChange={e => setCommentBuilder(p => ({ ...p, ip: e.target.value }))} placeholder="10.0.0.1" /></div>
-                </div>
-                <div className="flex-gap" style={{ marginBottom: 8, flexWrap: "wrap" }}>
-                  {["ssh", "http", "https"].map(proto => (
-                    <label key={proto} style={{ display: "flex", alignItems: "center", gap: 4, cursor: "pointer", fontSize: 12 }}>
-                      <input type="checkbox" checked={commentBuilder[proto]} onChange={e => setCommentBuilder(p => ({ ...p, [proto]: e.target.checked }))} />
-                      {proto.toUpperCase()}
-                    </label>
-                  ))}
-                </div>
-                <div className="field-row"><label>Custom lines</label><input value={commentBuilder.custom} onChange={e => setCommentBuilder(p => ({ ...p, custom: e.target.value }))} placeholder="Extra line" /></div>
-                <button className="btn-secondary" onClick={buildCommentFromIp}>Generate Comment -></button>
-              </div>
-            </div>
             <div className="field-row">
               <label>Comments (editable)</label>
-              <textarea value={comments} onChange={e => setComments(e.target.value)} style={{ height: 200, resize: "vertical" }} />
+              <textarea value={comments} onChange={e => setComments(e.target.value)} style={{ height: 200, resize: "vertical", ...(fieldHighlightStyle("comments", comments) || {}) }} />
             </div>
           </div>
         )}
