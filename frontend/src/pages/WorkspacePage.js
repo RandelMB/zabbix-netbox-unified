@@ -117,14 +117,14 @@ export function WorkspacePage({ pendingTab, onPendingConsumed }) {
   }
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
+    <div style={{ display: "flex", flexDirection: "column", height: "100%", minHeight: 0 }}>
       <div style={{ display: "flex", gap: 6, padding: "10px 16px", borderBottom: "1px solid var(--border)", background: "var(--bg2)", flexShrink: 0 }}>
         <button className="btn-secondary" onClick={() => setShowTransfer(prev => !prev)}>{showTransfer ? "Hide Compare" : "Show Compare"}</button>
         <button className="btn-secondary" onClick={() => setShowLog(prev => !prev)}>{showLog ? "Hide Log" : "Show Log"}</button>
       </div>
 
       {showTransfer && (
-        <div style={{ borderBottom: "1px solid var(--border)", background: "var(--bg2)", flexShrink: 0, maxHeight: 340, overflow: "auto" }}>
+        <div style={{ borderBottom: "1px solid var(--border)", background: "var(--bg2)", flexShrink: 0, maxHeight: 220, overflow: "auto" }}>
           <div className="section-header">
             <span>Central Workspace Control</span>
           </div>
@@ -132,11 +132,11 @@ export function WorkspacePage({ pendingTab, onPendingConsumed }) {
         </div>
       )}
 
-      <div style={{ flex: 1, display: "flex", overflow: "hidden" }}>
-        <div style={{ flex: 1, display: "grid", gridTemplateColumns: "1fr 1fr 1fr", overflow: "hidden" }}>
+      <div style={{ flex: 1, display: "flex", overflow: "hidden", minHeight: 0 }}>
+        <div style={{ flex: 1, display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", overflow: "hidden", minHeight: 0 }}>
           {["zabbix", "netbox", "observium"].map(type => (
-            <div key={type} style={{ display: "flex", flexDirection: "column", minWidth: 0, borderRight: type !== "observium" ? "1px solid var(--border)" : "none" }}>
-              <div style={{ padding: "10px 12px", borderBottom: "1px solid var(--border)", background: "var(--bg2)", display: "flex", alignItems: "center", gap: 8 }}>
+            <div key={type} style={{ display: "flex", flexDirection: "column", minWidth: 0, minHeight: 0, borderRight: type !== "observium" ? "1px solid var(--border)" : "none" }}>
+              <div style={{ padding: "10px 12px", borderBottom: "1px solid var(--border)", background: "var(--bg2)", display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
                 <span className={`tag ${PANEL_META[type].className}`} style={{ ...(PANEL_META[type].style || {}) }}>{PANEL_META[type].short}</span>
                 <strong style={{ fontSize: 12 }}>{PANEL_META[type].label}</strong>
                 <button
@@ -147,7 +147,7 @@ export function WorkspacePage({ pendingTab, onPendingConsumed }) {
                   + New
                 </button>
               </div>
-              <div style={{ padding: "6px 8px", borderBottom: "1px solid var(--border)", background: "var(--bg3)", display: "flex", gap: 6, overflowX: "auto" }}>
+              <div style={{ padding: "6px 8px", borderBottom: "1px solid var(--border)", background: "var(--bg3)", display: "flex", gap: 6, overflowX: "auto", flexShrink: 0 }}>
                 {tabsByType[type].length === 0 && <span style={{ color: "var(--text3)", fontSize: 11 }}>No device loaded</span>}
                 {tabsByType[type].map(tab => (
                   <div
@@ -177,7 +177,7 @@ export function WorkspacePage({ pendingTab, onPendingConsumed }) {
           ))}
         </div>
         {showLog && (
-          <div style={{ width: 320, flexShrink: 0, borderLeft: "1px solid var(--border)", background: "var(--bg2)", overflow: "hidden" }}>
+          <div style={{ width: 320, flexShrink: 0, borderLeft: "1px solid var(--border)", background: "var(--bg2)", overflow: "hidden", minHeight: 0 }}>
             <LogPanel />
           </div>
         )}

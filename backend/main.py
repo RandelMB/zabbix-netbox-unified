@@ -108,6 +108,20 @@ class CorrelationLinkPayload(BaseModel):
     observium: Optional[CorrelationItemPayload] = None
 
 
+class NetBoxEnrichmentActionPayload(BaseModel):
+    action_type: str
+    value: Optional[str] = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class NetBoxEnrichmentApplyPayload(BaseModel):
+    actions: list[NetBoxEnrichmentActionPayload] = Field(default_factory=list)
+
+
+class NetBoxPrimaryIpFixPayload(BaseModel):
+    dry_run: bool = False
+
+
 def app_db() -> sqlite3.Connection:
     db_path = Path(cfg.APP_DB_PATH)
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -507,6 +521,572 @@ def remove_correlation_item(group_id: int, source: str) -> dict[str, Any]:
         return {"status": "ok", "correlation": correlation_summary(group_id)}
     finally:
         conn.close()
+
+
+def is_blank(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return value.strip() == ""
+    if isinstance(value, (list, dict, set, tuple)):
+        return len(value) == 0
+    return False
+
+
+def compact_text(value: Any) -> str:
+    return " ".join(str(value or "").strip().split())
+
+
+def normalize_key(value: Any) -> str:
+    normalized = compact_text(value).lower()
+    return "".join(char if char.isalnum() else " " for char in normalized).strip()
+
+
+def slugify_text(value: Any) -> str:
+    normalized = normalize_key(value).replace(" ", "-")
+    return normalized.strip("-") or "auto-generated"
+
+
+def normalize_ip_value(address: str) -> str:
+    trimmed = compact_text(address)
+    if not trimmed:
+        return ""
+    if "/" in trimmed:
+        return trimmed
+    return f"{trimmed}/128" if ":" in trimmed else f"{trimmed}/32"
+
+
+def host_part(address: str) -> str:
+    return compact_text(address).split("/")[0]
+
+
+def ipv4_candidate(value: Any) -> Optional[str]:
+    raw = compact_text(value)
+    if not raw:
+        return None
+    try:
+        parsed = ipaddress.ip_interface(raw if "/" in raw else f"{raw}/32")
+    except ValueError:
+        return None
+    if parsed.version != 4:
+        return None
+    return str(parsed)
+
+
+def description_ip_candidate(device: dict[str, Any]) -> Optional[str]:
+    return ipv4_candidate(device.get("description"))
+
+
+def extract_main_zabbix_ip(host: dict[str, Any]) -> Optional[str]:
+    interfaces = host.get("interfaces") or []
+    preferred = next((item for item in interfaces if str(item.get("main")) == "1"), None) or (interfaces[0] if interfaces else None)
+    if not preferred:
+        return None
+    raw = preferred.get("ip") if str(preferred.get("useip", "1")) == "1" else preferred.get("dns")
+    return ipv4_candidate(raw)
+
+
+def extract_observium_ipv4(device: dict[str, Any]) -> Optional[str]:
+    return ipv4_candidate(device.get("ip"))
+
+
+def build_enriched_comments(device: dict[str, Any], zabbix_host: Optional[dict[str, Any]], observium_device: Optional[dict[str, Any]]) -> str:
+    lines: list[str] = []
+    sys_name = compact_text((observium_device or {}).get("sysName"))
+    location = compact_text((observium_device or {}).get("location") or ((zabbix_host or {}).get("inventory") or {}).get("location"))
+    version = compact_text((observium_device or {}).get("version") or (zabbix_host or {}).get("vendor_version"))
+    os_name = compact_text((observium_device or {}).get("os"))
+    hardware = compact_text((observium_device or {}).get("hardware"))
+
+    if sys_name:
+        lines.append(f"sysName: {sys_name}")
+    if location:
+        lines.append(f"SNMP location: {location}")
+    if hardware or os_name or version:
+        parts = [part for part in [hardware, os_name, version] if part]
+        lines.append("Platform detail: " + " | ".join(parts))
+
+    current = compact_text(device.get("comments"))
+    if current:
+        lines.insert(0, current)
+    return "\n".join(dict.fromkeys(line for line in lines if line))
+
+
+def build_enriched_description(device: dict[str, Any], zabbix_host: Optional[dict[str, Any]], observium_device: Optional[dict[str, Any]]) -> str:
+    hardware = compact_text((observium_device or {}).get("hardware"))
+    version = compact_text((observium_device or {}).get("version"))
+    os_name = compact_text((observium_device or {}).get("os"))
+    visible_name = compact_text((zabbix_host or {}).get("name"))
+    parts = [part for part in [hardware, os_name, version] if part]
+    if parts:
+        return " | ".join(parts)
+    if visible_name and visible_name != compact_text((zabbix_host or {}).get("host")):
+        return visible_name
+    return compact_text(device.get("description"))
+
+
+def pick_platform_name(device: dict[str, Any], zabbix_host: Optional[dict[str, Any]], observium_device: Optional[dict[str, Any]]) -> Optional[str]:
+    vendor = compact_text((observium_device or {}).get("vendor") or (device.get("device_type") or {}).get("manufacturer", {}).get("name"))
+    os_name = compact_text((observium_device or {}).get("os") or (zabbix_host or {}).get("vendor_name"))
+    lookup = {
+        ("cisco", "ios"): "Cisco IOS",
+        ("cisco", "iosxe"): "Cisco IOS XE",
+        ("fortinet", "fortios"): "FortiOS",
+        ("fortinet", "fortiswitch"): "FortiSwitchOS",
+        ("mikrotik", "routeros"): "MikroTik RouterOS",
+        ("vmware", "esxi"): "VMware ESXi",
+    }
+    key = (vendor.lower(), os_name.lower())
+    if key in lookup:
+        return lookup[key]
+    if vendor and os_name:
+        return f"{vendor} {os_name.upper()}" if len(os_name) <= 6 else f"{vendor} {os_name}"
+    if os_name:
+        return os_name.upper() if len(os_name) <= 6 else os_name
+    return None
+
+
+async def netbox_paginated(path: str, params: Optional[dict[str, Any]] = None) -> list[dict[str, Any]]:
+    query = dict(params or {})
+    query.setdefault("limit", 500)
+    result = await netbox_request("GET", path, query)
+    payload = result.get("result")
+    if isinstance(payload, dict) and "results" in payload:
+        return payload.get("results", [])
+    if isinstance(payload, list):
+        return payload
+    return []
+
+
+async def netbox_find_platform(name: str) -> Optional[dict[str, Any]]:
+    target = normalize_key(name)
+    for item in await netbox_paginated("/dcim/platforms/"):
+        if normalize_key(item.get("name")) == target or normalize_key(item.get("display")) == target:
+            return item
+    return None
+
+
+async def ensure_netbox_platform(name: str) -> dict[str, Any]:
+    existing = await netbox_find_platform(name)
+    if existing:
+        return {"created": False, "platform": existing}
+    created = await netbox_request("POST", "/dcim/platforms/", {"name": name, "slug": slugify_text(name)[:100]})
+    return {"created": True, "platform": created.get("result") or created.get("response") or {}}
+
+
+async def netbox_find_location(name: str, site_id: Optional[int]) -> Optional[dict[str, Any]]:
+    params: dict[str, Any] = {}
+    if site_id:
+        params["site_id"] = site_id
+    target = normalize_key(name)
+    for item in await netbox_paginated("/dcim/locations/", params):
+        if normalize_key(item.get("name")) == target or normalize_key(item.get("display")) == target:
+            return item
+    return None
+
+
+async def ensure_netbox_location(name: str, site_id: Optional[int]) -> dict[str, Any]:
+    existing = await netbox_find_location(name, site_id)
+    if existing:
+        return {"created": False, "location": existing}
+    if not site_id:
+        raise HTTPException(400, "NetBox site is required to create a location")
+    created = await netbox_request(
+        "POST",
+        "/dcim/locations/",
+        {"name": name, "slug": slugify_text(name)[:90], "site": int(site_id)},
+    )
+    return {"created": True, "location": created.get("result") or created.get("response") or {}}
+
+
+async def zabbix_host_items(host_id: str) -> list[dict[str, Any]]:
+    result = await zabbix_request(
+        "item.get",
+        {
+            "output": ["itemid", "hostid", "name", "key_", "snmp_oid", "lastvalue", "value_type", "status", "state", "error"],
+            "hostids": [host_id],
+            "filter": {"status": 0},
+        },
+    )
+    return result.get("result") or []
+
+
+async def find_zabbix_serial_item(host_id: str) -> Optional[dict[str, Any]]:
+    candidates = await zabbix_host_items(host_id)
+    for item in candidates:
+        key_name = compact_text(item.get("key_")).lower()
+        item_name = compact_text(item.get("name")).lower()
+        snmp_oid = compact_text(item.get("snmp_oid"))
+        if "entphysicalserialnum" in key_name or "entphysicalserialnum" in item_name or ".1.3.6.1.2.1.47.1.1.1.1.11.1" in snmp_oid:
+            return item
+    return None
+
+
+async def ensure_zabbix_serial_item(host_id: str) -> dict[str, Any]:
+    existing = await find_zabbix_serial_item(host_id)
+    if existing:
+        return {"status": "exists", "item": existing}
+
+    host_result = await zabbix_request("host.get", {"output": ["hostid"], "hostids": [host_id], "selectInterfaces": "extend"})
+    if not host_result.get("result"):
+        raise HTTPException(404, "Zabbix host not found")
+    host = host_result["result"][0]
+    interface = next((item for item in host.get("interfaces", []) if str(item.get("type")) == "2"), None)
+    if not interface:
+        raise HTTPException(400, "No SNMP interface available on the correlated Zabbix host")
+
+    created = await zabbix_request(
+        "item.create",
+        {
+            "hostid": host_id,
+            "interfaceid": interface["interfaceid"],
+            "type": 20,
+            "value_type": 4,
+            "name": "SNMP entPhysicalSerialNum",
+            "key_": "snmp.entPhysicalSerialNum",
+            "snmp_oid": ".1.3.6.1.2.1.47.1.1.1.1.11.1",
+            "delay": "1h",
+        },
+    )
+    return {"status": "created", "result": created.get("result")}
+
+
+def serial_candidate_from_zabbix(host: Optional[dict[str, Any]], serial_item: Optional[dict[str, Any]]) -> Optional[str]:
+    inventory = (host or {}).get("inventory") or {}
+    for key in ("serialno_a", "serialno_b", "serialno"):
+        candidate = compact_text(inventory.get(key))
+        if candidate:
+            return candidate
+    latest = compact_text((serial_item or {}).get("lastvalue"))
+    if latest:
+        return latest
+    return None
+
+
+def observium_device_row(device_id: int) -> Optional[dict[str, Any]]:
+    row = observium_db_query(
+        """
+        SELECT
+            device_id, hostname, sysName, label, ip,
+            snmp_version, snmp_community, snmp_port, snmp_transport,
+            snmp_authlevel, snmp_authname, snmp_authalgo, snmp_context,
+            status, disabled, `ignore`, location, purpose, os, vendor, hardware, version
+        FROM devices
+        WHERE device_id = %s
+        """,
+        (device_id,),
+        fetch="one",
+    )
+    if not row:
+        return None
+    return normalize_observium_device(row)
+
+
+async def correlated_sources_for_netbox_device(device_id: int) -> dict[str, Any]:
+    correlation = find_correlation_by_item("netbox", str(device_id))
+    if not correlation:
+        raise HTTPException(404, "No saved correlation exists for this NetBox device")
+
+    items = correlation.get("items") or {}
+    zabbix_host = None
+    observium_device = None
+
+    if items.get("zabbix"):
+        zabbix_result = await zabbix_request(
+            "host.get",
+            {
+                "output": "extend",
+                "hostids": [items["zabbix"]["id"]],
+                "selectInterfaces": "extend",
+                "selectInventory": "extend",
+                "selectTags": "extend",
+                "selectMacros": "extend",
+            },
+        )
+        zabbix_host = (zabbix_result.get("result") or [None])[0]
+
+    if items.get("observium"):
+        observium_device = observium_device_row(int(items["observium"]["id"]))
+
+    return {"correlation": correlation, "zabbix": zabbix_host, "observium": observium_device}
+
+
+async def choose_primary_interface(device_id: int) -> dict[str, Any]:
+    interfaces = await netbox_paginated("/dcim/interfaces/", {"device_id": device_id})
+    if interfaces:
+        def score(item: dict[str, Any]) -> tuple[int, int]:
+            name = compact_text(item.get("name")).lower()
+            if any(token in name for token in ("mgmt", "management", "oob")):
+                return (0, 0)
+            if "vlan1" in name or "vlan 1" in name:
+                return (1, 0)
+            return (2, int(not item.get("enabled", True)))
+        return sorted(interfaces, key=score)[0]
+
+    created = await netbox_request(
+        "POST",
+        "/dcim/interfaces/",
+        {"device": int(device_id), "name": "mgmt0", "type": "virtual", "enabled": True},
+    )
+    return created.get("result") or created.get("response") or {}
+
+
+async def ip_assigned_device(ip_payload: dict[str, Any]) -> Optional[int]:
+    assigned_object = ip_payload.get("assigned_object") or {}
+    interface_url = assigned_object.get("url")
+    if interface_url:
+        iface_result = await netbox_request("GET", interface_url.replace(f"{get_netbox_url()}/api", ""))
+        iface = iface_result.get("result") or {}
+        device = iface.get("device") or {}
+        if device.get("id") is not None:
+            return int(device["id"])
+    return None
+
+
+async def ensure_netbox_primary_ip4(device: dict[str, Any], address: str, status: str = "active") -> dict[str, Any]:
+    normalized = normalize_ip_value(address)
+    if not normalized:
+        raise HTTPException(400, "IPv4 candidate is empty")
+
+    chosen_interface = await choose_primary_interface(int(device["id"]))
+    search_results = await netbox_paginated("/ipam/ip-addresses/", {"address": host_part(normalized), "limit": 50})
+
+    reusable = None
+    conflict = None
+    for candidate in search_results:
+        if host_part(candidate.get("address", "")) != host_part(normalized):
+            continue
+        assigned_device_id = await ip_assigned_device(candidate) if candidate.get("assigned_object") else None
+        if assigned_device_id in {None, int(device["id"])}:
+            reusable = candidate
+            break
+        conflict = candidate
+
+    if conflict and reusable is None:
+        raise HTTPException(409, f"IP {host_part(normalized)} is already assigned to another NetBox device")
+
+    if reusable:
+        update_payload = {
+            "address": normalized,
+            "status": status,
+            "assigned_object_type": "dcim.interface",
+            "assigned_object_id": int(chosen_interface["id"]),
+        }
+        await netbox_request("PATCH", f"/ipam/ip-addresses/{int(reusable['id'])}/", update_payload)
+        ip_id = int(reusable["id"])
+        created = False
+    else:
+        created_result = await netbox_request(
+            "POST",
+            "/ipam/ip-addresses/",
+            {
+                "address": normalized,
+                "status": status,
+                "assigned_object_type": "dcim.interface",
+                "assigned_object_id": int(chosen_interface["id"]),
+            },
+        )
+        created_ip = created_result.get("result") or created_result.get("response") or {}
+        ip_id = int(created_ip["id"])
+        created = True
+
+    await netbox_set_primary_ip(int(device["id"]), {"ip_id": ip_id})
+    return {"ip_id": ip_id, "address": normalized, "created": created, "interface": chosen_interface}
+
+
+async def build_netbox_enrichment(device_id: int) -> dict[str, Any]:
+    device_result = await netbox_request("GET", f"/dcim/devices/{device_id}/")
+    device = device_result.get("result") or {}
+    sources = await correlated_sources_for_netbox_device(device_id)
+    zabbix_host = sources["zabbix"]
+    observium_device = sources["observium"]
+    serial_item = await find_zabbix_serial_item(str(zabbix_host["hostid"])) if zabbix_host else None
+
+    platform_name = pick_platform_name(device, zabbix_host, observium_device)
+    location_name = compact_text((observium_device or {}).get("location") or ((zabbix_host or {}).get("inventory") or {}).get("location"))
+    zabbix_ip = extract_main_zabbix_ip(zabbix_host or {})
+    observium_ip = extract_observium_ipv4(observium_device or {})
+    description_ip = description_ip_candidate(device)
+    serial_candidate = serial_candidate_from_zabbix(zabbix_host, serial_item)
+
+    suggestions: list[dict[str, Any]] = []
+
+    if is_blank(device.get("platform")) and platform_name:
+        existing_platform = await netbox_find_platform(platform_name)
+        suggestions.append(
+            {
+                "id": "platform_from_monitoring",
+                "action_type": "set_platform",
+                "field": "platform",
+                "label": "Map platform from Observium/Zabbix",
+                "current_value": (device.get("platform") or {}).get("display") or "",
+                "proposed_value": platform_name,
+                "source": "observium",
+                "confidence": "medium",
+                "requires_create": not bool(existing_platform),
+                "target_section": "DCIM > Platforms",
+            }
+        )
+
+    if is_blank(device.get("location")) and location_name:
+        existing_location = await netbox_find_location(location_name, (device.get("site") or {}).get("id"))
+        suggestions.append(
+            {
+                "id": "location_from_monitoring",
+                "action_type": "set_location",
+                "field": "location",
+                "label": "Map location from SNMP location",
+                "current_value": (device.get("location") or {}).get("display") or "",
+                "proposed_value": location_name,
+                "source": "observium",
+                "confidence": "medium",
+                "requires_create": not bool(existing_location),
+                "target_section": "DCIM > Locations",
+            }
+        )
+
+    if is_blank(device.get("primary_ip4")) and zabbix_ip:
+        suggestions.append(
+            {
+                "id": "primary_ip4_from_zabbix",
+                "action_type": "set_primary_ip4",
+                "field": "primary_ip4",
+                "label": "Set primary IPv4 from Zabbix",
+                "current_value": (device.get("primary_ip4") or {}).get("address") or "",
+                "proposed_value": zabbix_ip,
+                "source": "zabbix",
+                "confidence": "high",
+                "requires_create": True,
+                "target_section": "IPAM > IP Addresses",
+            }
+        )
+    elif is_blank(device.get("primary_ip4")) and observium_ip:
+        suggestions.append(
+            {
+                "id": "primary_ip4_from_observium",
+                "action_type": "set_primary_ip4",
+                "field": "primary_ip4",
+                "label": "Set primary IPv4 from Observium",
+                "current_value": (device.get("primary_ip4") or {}).get("address") or "",
+                "proposed_value": observium_ip,
+                "source": "observium",
+                "confidence": "medium",
+                "requires_create": True,
+                "target_section": "IPAM > IP Addresses",
+            }
+        )
+
+    if description_ip and is_blank(device.get("primary_ip4")):
+        suggestions.append(
+            {
+                "id": "migrate_description_ip",
+                "action_type": "migrate_description_ip",
+                "field": "primary_ip4",
+                "label": "Move IP stored in description to primary IPv4",
+                "current_value": compact_text(device.get("description")),
+                "proposed_value": description_ip,
+                "source": "netbox",
+                "confidence": "high",
+                "requires_create": True,
+                "target_section": "IPAM > IP Addresses",
+            }
+        )
+
+    enriched_description = build_enriched_description(device, zabbix_host, observium_device)
+    if (is_blank(device.get("description")) or description_ip) and compact_text(enriched_description):
+        suggestions.append(
+            {
+                "id": "description_from_monitoring",
+                "action_type": "set_description",
+                "field": "description",
+                "label": "Enrich description from monitoring data",
+                "current_value": compact_text(device.get("description")),
+                "proposed_value": enriched_description,
+                "source": "observium",
+                "confidence": "medium",
+                "requires_create": False,
+                "target_section": "Device field",
+            }
+        )
+
+    enriched_comments = build_enriched_comments(device, zabbix_host, observium_device)
+    if is_blank(device.get("comments")) and compact_text(enriched_comments):
+        suggestions.append(
+            {
+                "id": "comments_from_monitoring",
+                "action_type": "set_comments",
+                "field": "comments",
+                "label": "Generate comments from SNMP metadata",
+                "current_value": compact_text(device.get("comments")),
+                "proposed_value": enriched_comments,
+                "source": "observium",
+                "confidence": "medium",
+                "requires_create": False,
+                "target_section": "Device field",
+            }
+        )
+
+    if is_blank(device.get("serial")) and serial_candidate:
+        suggestions.append(
+            {
+                "id": "serial_from_zabbix",
+                "action_type": "set_serial",
+                "field": "serial",
+                "label": "Sync serial from Zabbix",
+                "current_value": compact_text(device.get("serial")),
+                "proposed_value": serial_candidate,
+                "source": "zabbix",
+                "confidence": "medium",
+                "requires_create": False,
+                "target_section": "Device field",
+            }
+        )
+
+    if is_blank(device.get("serial")) and zabbix_host and not serial_candidate:
+        suggestions.append(
+            {
+                "id": "ensure_zabbix_serial_item",
+                "action_type": "ensure_zabbix_serial_item",
+                "field": "serial",
+                "label": "Create Zabbix SNMP item for entPhysicalSerialNum",
+                "current_value": "",
+                "proposed_value": ".1.3.6.1.2.1.47.1.1.1.1.11.1",
+                "source": "zabbix",
+                "confidence": "medium",
+                "requires_create": False,
+                "target_section": "Zabbix SNMP item",
+                "note": "Value will populate after the next Zabbix poll if the device exposes entPhysicalSerialNum.1",
+            }
+        )
+
+    return {
+        "device": device,
+        "correlation": sources["correlation"],
+        "sources": {
+            "zabbix": {
+                "hostid": str(zabbix_host.get("hostid")) if zabbix_host else None,
+                "host": (zabbix_host or {}).get("host"),
+                "name": (zabbix_host or {}).get("name"),
+                "main_ip": zabbix_ip,
+            } if zabbix_host else None,
+            "observium": {
+                "device_id": str(observium_device.get("device_id")) if observium_device else None,
+                "hostname": (observium_device or {}).get("hostname"),
+                "sysName": (observium_device or {}).get("sysName"),
+                "ip": observium_ip,
+                "location": (observium_device or {}).get("location"),
+                "os": (observium_device or {}).get("os"),
+                "vendor": (observium_device or {}).get("vendor"),
+                "hardware": (observium_device or {}).get("hardware"),
+                "version": (observium_device or {}).get("version"),
+            } if observium_device else None,
+        },
+        "manual_fields": {
+            "asset_tag": compact_text(device.get("asset_tag")),
+            "serial": compact_text(device.get("serial")),
+        },
+        "suggestions": suggestions,
+    }
 
 
 def first_non_empty(data: dict[str, Any], *keys: str) -> Optional[str]:
@@ -1030,14 +1610,152 @@ async def netbox_device_types():
     return await netbox_request("GET", "/dcim/device-types/", {"limit": 200})
 
 
+@app.get("/api/netbox/platforms")
+async def netbox_platforms():
+    return await netbox_request("GET", "/dcim/platforms/", {"limit": 500})
+
+
+@app.post("/api/netbox/platforms")
+async def netbox_create_platform(body: dict[str, Any]):
+    return await netbox_request("POST", "/dcim/platforms/", body)
+
+
 @app.get("/api/netbox/sites")
 async def netbox_sites():
     return await netbox_request("GET", "/dcim/sites/", {"limit": 200})
 
 
+@app.get("/api/netbox/locations")
+async def netbox_locations(site_id: Optional[int] = None):
+    params: dict[str, Any] = {"limit": 500}
+    if site_id:
+        params["site_id"] = site_id
+    return await netbox_request("GET", "/dcim/locations/", params)
+
+
+@app.post("/api/netbox/locations")
+async def netbox_create_location(body: dict[str, Any]):
+    return await netbox_request("POST", "/dcim/locations/", body)
+
+
 @app.get("/api/netbox/roles")
 async def netbox_device_roles():
     return await netbox_request("GET", "/dcim/device-roles/", {"limit": 200})
+
+
+@app.get("/api/netbox/devices/{device_id}/enrichment")
+async def netbox_device_enrichment(device_id: int):
+    return {"status": "ok", "result": await build_netbox_enrichment(device_id)}
+
+
+@app.post("/api/netbox/devices/{device_id}/enrichment/apply")
+async def netbox_apply_enrichment(device_id: int, body: NetBoxEnrichmentApplyPayload):
+    if not body.actions:
+        raise HTTPException(400, "No enrichment actions were provided")
+
+    device_result = await netbox_request("GET", f"/dcim/devices/{device_id}/")
+    device = device_result.get("result") or {}
+    sources = await correlated_sources_for_netbox_device(device_id)
+    zabbix_host = sources["zabbix"]
+    results: list[dict[str, Any]] = []
+
+    for action in body.actions:
+        action_type = action.action_type
+        value = compact_text(action.value)
+        try:
+            if action_type == "set_platform":
+                if not value:
+                    raise HTTPException(400, "Platform value is required")
+                ensured = await ensure_netbox_platform(value)
+                platform = ensured["platform"]
+                updated = await netbox_request("PATCH", f"/dcim/devices/{device_id}/", {"platform": int(platform["id"])})
+                results.append({"action_type": action_type, "status": "ok", "created": ensured["created"], "platform": platform, "device": updated.get("result")})
+            elif action_type == "set_location":
+                if not value:
+                    raise HTTPException(400, "Location value is required")
+                ensured = await ensure_netbox_location(value, (device.get("site") or {}).get("id"))
+                location = ensured["location"]
+                updated = await netbox_request("PATCH", f"/dcim/devices/{device_id}/", {"location": int(location["id"])})
+                results.append({"action_type": action_type, "status": "ok", "created": ensured["created"], "location": location, "device": updated.get("result")})
+            elif action_type == "set_primary_ip4":
+                applied = await ensure_netbox_primary_ip4(device, value)
+                results.append({"action_type": action_type, "status": "ok", **applied})
+            elif action_type == "migrate_description_ip":
+                applied = await ensure_netbox_primary_ip4(device, value or compact_text(device.get("description")))
+                cleared = await netbox_request("PATCH", f"/dcim/devices/{device_id}/", {"description": ""})
+                results.append({"action_type": action_type, "status": "ok", **applied, "description_cleared": True, "device": cleared.get("result")})
+            elif action_type == "set_comments":
+                updated = await netbox_request("PATCH", f"/dcim/devices/{device_id}/", {"comments": action.value or ""})
+                results.append({"action_type": action_type, "status": "ok", "device": updated.get("result")})
+            elif action_type == "set_description":
+                updated = await netbox_request("PATCH", f"/dcim/devices/{device_id}/", {"description": action.value or ""})
+                results.append({"action_type": action_type, "status": "ok", "device": updated.get("result")})
+            elif action_type == "set_serial":
+                updated = await netbox_request("PATCH", f"/dcim/devices/{device_id}/", {"serial": action.value or ""})
+                results.append({"action_type": action_type, "status": "ok", "device": updated.get("result")})
+            elif action_type == "set_asset_tag":
+                updated = await netbox_request("PATCH", f"/dcim/devices/{device_id}/", {"asset_tag": action.value or ""})
+                results.append({"action_type": action_type, "status": "ok", "device": updated.get("result")})
+            elif action_type == "ensure_zabbix_serial_item":
+                if not zabbix_host:
+                    raise HTTPException(400, "No correlated Zabbix host is available")
+                ensured = await ensure_zabbix_serial_item(str(zabbix_host["hostid"]))
+                results.append({"action_type": action_type, "status": "ok", **ensured})
+            else:
+                raise HTTPException(400, f"Unsupported enrichment action: {action_type}")
+        except HTTPException as exc:
+            results.append({"action_type": action_type, "status": "error", "error": exc.detail})
+
+    refreshed = await build_netbox_enrichment(device_id)
+    return {"status": "ok", "results": results, "result": refreshed}
+
+
+@app.post("/api/netbox/enrichment/fix-primary-ip4-correlated")
+async def netbox_fix_primary_ip4_correlated(body: NetBoxPrimaryIpFixPayload = NetBoxPrimaryIpFixPayload()):
+    results: list[dict[str, Any]] = []
+    for group in list_correlations():
+        items = group.get("items") or {}
+        nb_item = items.get("netbox")
+        zb_item = items.get("zabbix")
+        if not nb_item or not zb_item:
+            continue
+        if archive_status("netbox", nb_item["id"]):
+            continue
+
+        try:
+            device_result = await netbox_request("GET", f"/dcim/devices/{int(nb_item['id'])}/")
+            device = device_result.get("result") or {}
+            zabbix_result = await zabbix_request(
+                "host.get",
+                {
+                    "output": "extend",
+                    "hostids": [zb_item["id"]],
+                    "selectInterfaces": "extend",
+                    "selectInventory": "extend",
+                },
+            )
+            host = (zabbix_result.get("result") or [None])[0]
+            if not host:
+                results.append({"device_id": nb_item["id"], "device": nb_item.get("label"), "status": "skipped", "reason": "Missing correlated Zabbix host"})
+                continue
+
+            candidate_ip = extract_main_zabbix_ip(host)
+            if not candidate_ip:
+                results.append({"device_id": nb_item["id"], "device": device.get("name"), "status": "skipped", "reason": "No IPv4 on main Zabbix interface"})
+                continue
+            if device.get("primary_ip4"):
+                results.append({"device_id": nb_item["id"], "device": device.get("name"), "status": "skipped", "reason": "Primary IPv4 already set", "current": device.get("primary_ip4", {}).get("address")})
+                continue
+            if body.dry_run:
+                results.append({"device_id": nb_item["id"], "device": device.get("name"), "status": "planned", "proposed_ip": candidate_ip})
+                continue
+
+            applied = await ensure_netbox_primary_ip4(device, candidate_ip)
+            results.append({"device_id": nb_item["id"], "device": device.get("name"), "status": "updated", **applied})
+        except HTTPException as exc:
+            results.append({"device_id": nb_item["id"], "device": nb_item.get("label"), "status": "error", "error": exc.detail})
+
+    return {"status": "ok", "count": len(results), "result": results}
 
 
 @app.get("/api/observium/devices")

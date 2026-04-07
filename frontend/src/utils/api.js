@@ -77,7 +77,12 @@ export const api = {
   netboxDeleteIP: (id) => req("DELETE", `/api/netbox/ips/${id}`),
   netboxSites: () => req("GET", "/api/netbox/sites"),
   netboxDeviceTypes: () => req("GET", "/api/netbox/device-types"),
+  netboxPlatforms: () => req("GET", "/api/netbox/platforms"),
+  netboxLocations: (siteId = "") => req("GET", `/api/netbox/locations${siteId ? `?site_id=${encodeURIComponent(siteId)}` : ""}`),
   netboxRoles: () => req("GET", "/api/netbox/roles"),
+  netboxEnrichment: (deviceId) => req("GET", `/api/netbox/devices/${deviceId}/enrichment`),
+  netboxApplyEnrichment: (deviceId, b) => req("POST", `/api/netbox/devices/${deviceId}/enrichment/apply`, b),
+  netboxFixPrimaryIpsCorrelated: (b = {}) => req("POST", "/api/netbox/enrichment/fix-primary-ip4-correlated", b),
 
   // Observium
   observiumDevices: (limit = 500, search = "", archived = "exclude") => req("GET", `/api/observium/devices?limit=${limit}&search=${encodeURIComponent(search)}&archived=${encodeURIComponent(archived)}`),

@@ -6,6 +6,8 @@ services:
     container_name: zneditor-backend
     env_file:
       - .env
+    environment:
+      ZNEDITOR_DEPLOY_MARKER: netbox-enrichment-v1
     volumes:
       - ./backend:/app
       - /var/run/docker.sock:/var/run/docker.sock
