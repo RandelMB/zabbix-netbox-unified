@@ -15,6 +15,7 @@ const EMPTY_DEVICE = {
   snmp_transport: "udp",
   location: "",
   purpose: "",
+  skip_icmp: false,
   disabled: false,
   ignore: false,
 };
@@ -72,6 +73,7 @@ export function ObserviumEditor({ deviceId, onDataReady }) {
       snmp_transport: device.snmp_transport,
       location: device.location,
       purpose: device.purpose,
+      skip_icmp: !!device.skip_icmp,
       disabled: !!device.disabled,
       ignore: !!device.ignore,
     }),
@@ -214,6 +216,13 @@ export function ObserviumEditor({ deviceId, onDataReady }) {
                 <input value={device.purpose || ""} onChange={e => updateField("purpose", e.target.value)} />
               </div>
               <div className="field-row">
+                <label>Skip ICMP Echo Checks</label>
+                <select value={device.skip_icmp ? "1" : "0"} onChange={e => updateField("skip_icmp", e.target.value === "1")}>
+                  <option value="0">No</option>
+                  <option value="1">Yes</option>
+                </select>
+              </div>
+              <div className="field-row">
                 <label>Transport</label>
                 <select value={device.snmp_transport || "udp"} onChange={e => updateField("snmp_transport", e.target.value)}>
                   <option value="udp">udp</option>
@@ -307,6 +316,7 @@ export function ObserviumEditor({ deviceId, onDataReady }) {
                   snmp_community: device.snmp_community,
                   snmp_port: Number(device.snmp_port || 161),
                   snmp_transport: device.snmp_transport,
+                  skip_icmp: !!device.skip_icmp,
                   run_discovery: true,
                   run_poller: true,
                 },

@@ -74,6 +74,13 @@ function normalizeHost(data) {
   };
 }
 
+function safeScalar(value) {
+  if (value === null || value === undefined) return "";
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  return JSON.stringify(value);
+}
+
 function ensureSnmpDetails(iface) {
   return {
     ...EMPTY_SNMP_DETAILS,
@@ -85,14 +92,23 @@ function isSnmpInterface(iface) {
   return String(iface?.type) === "2";
 }
 
-function resolveSnmpCommunity(iface, host) {
-  const detailsCommunity = ensureSnmpDetails(iface).community;
-  if (detailsCommunity) return detailsCommunity;
-  const macro = (host?.macros || []).find(item => item.macro === "{$SNMP_COMMUNITY}");
+function hostMacroValue(host, macroName) {
+  const target = String(macroName || "").trim();
+  if (!target) return "";
+  const macro = (host?.macros || []).find(item => String(item.macro || "").trim() === target);
   return macro?.value || "";
 }
 
-function buildInterfacePayload(iface) {
+function resolveSnmpCommunity(iface, host) {
+  const detailsCommunity = String(ensureSnmpDetails(iface).community || "").trim();
+  if (/^\{\$[^}]+\}$/.test(detailsCommunity)) {
+    return hostMacroValue(host, detailsCommunity) || detailsCommunity;
+  }
+  if (detailsCommunity) return detailsCommunity;
+  return hostMacroValue(host, "{$SNMP_COMMUNITY}");
+}
+
+function buildInterfacePayload(iface, host) {
   const payload = {
     ip: iface.ip || "",
     dns: iface.dns || "",
@@ -107,7 +123,7 @@ function buildInterfacePayload(iface) {
     payload.details = {
       version: String(details.version || "2"),
       bulk: String(details.bulk || "1"),
-      community: details.community || "",
+      community: resolveSnmpCommunity(iface, host) || "",
       max_repetitions: String(details.max_repetitions || "10"),
     };
   }
@@ -407,7 +423,7 @@ export function ZabbixEditor({ hostId, onDataReady }) {
       status: String(host.status || "0"),
       description: host.description || "",
       groups: (host.groups || []).map(group => ({ groupid: String(group.groupid || group.id) })),
-      interfaces: (host.interfaces || []).map(buildInterfacePayload),
+      interfaces: (host.interfaces || []).map(iface => buildInterfacePayload(iface, host)),
     };
 
     const macros = (host.macros || []).filter(item => item.macro || item.value);
@@ -428,7 +444,7 @@ export function ZabbixEditor({ hostId, onDataReady }) {
       const usesIp = String(iface.useip || "1") === "1";
       if (usesIp && !iface.ip?.trim()) return "Each interface using IP must define an IP address";
       if (!usesIp && !iface.dns?.trim()) return "Each interface using DNS must define a DNS name";
-      if (isSnmpInterface(iface) && !resolveSnmpCommunity(iface, host)) return "Each SNMP interface must define a community or use {$SNMP_COMMUNITY}";
+      if (isSnmpInterface(iface) && !resolveSnmpCommunity(iface, host)) return "Each SNMP interface must define a community or use a Zabbix user macro like {$RO}";
     }
 
     return "";
@@ -556,7 +572,7 @@ export function ZabbixEditor({ hostId, onDataReady }) {
                             style={{ padding: "2px 8px", fontSize: 10 }}
                             onClick={() => setConfirm({
                               title: "Update Interface",
-                              payload: buildInterfacePayload(iface),
+                              payload: buildInterfacePayload(iface, host),
                               onConfirm: async payload => {
                                 setSaving(true);
                                 try {
@@ -754,7 +770,7 @@ export function ZabbixEditor({ hostId, onDataReady }) {
                 {Object.entries(host.inventory).filter(([key]) => key !== "hostid").map(([key, value]) => (
                   <div className="field-row" key={key}>
                     <label>{key}</label>
-                    <input value={value || ""} onChange={e => updateField(`inventory.${key}`, e.target.value)} />
+                    <input value={safeScalar(value)} onChange={e => updateField(`inventory.${key}`, e.target.value)} />
                   </div>
                 ))}
               </div>
@@ -784,7 +800,7 @@ export function ZabbixEditor({ hostId, onDataReady }) {
                     </td>
                     <td>
                       <input
-                        value={tag.value || ""}
+                        value={safeScalar(tag.value)}
                         onChange={e => updateHostList("tags", items => items.map((item, itemIndex) => itemIndex === index ? { ...item, value: e.target.value } : item))}
                       />
                     </td>
@@ -819,7 +835,7 @@ export function ZabbixEditor({ hostId, onDataReady }) {
                     </td>
                     <td>
                       <input
-                        value={macro.value || ""}
+                        value={safeScalar(macro.value)}
                         onChange={e => updateHostList("macros", items => items.map((item, itemIndex) => itemIndex === index ? { ...item, value: e.target.value } : item))}
                       />
                     </td>

@@ -55,15 +55,6 @@ function buildCorrelationPayload(zabbixData, netboxData, observiumData, label) {
   return payload;
 }
 
-function comparisonRows(zabbixData, netboxData, observiumData) {
-  return [
-    { field: "Name", zabbix: zabbixData?.host || "-", netbox: netboxData?.name || "-", observium: observiumData?.hostname || "-" },
-    { field: "IP", zabbix: getMainZabbixIp(zabbixData) || "-", netbox: getNetBoxIp(netboxData) || "-", observium: observiumData?.ip || "-" },
-    { field: "Location", zabbix: zabbixData?.inventory?.location || "-", netbox: netboxData?.site?.name || "-", observium: observiumData?.location || "-" },
-    { field: "SNMP", zabbix: zabbixData?.interfaces?.find(item => item.type === "2")?.details?.community || "-", netbox: "-", observium: observiumData?.snmp_community || "-" },
-  ];
-}
-
 function correlationLabel(data) {
   if (!data) return "No linked devices";
   return data.label || Object.values(data.items || {}).map(item => item.label || item.id).filter(Boolean).join(" | ") || `Group ${data.id}`;
@@ -243,7 +234,8 @@ export function TransferPanel({ zabbixData, netboxData, observiumData }) {
           setSaving(true);
           try {
             const result = await api.exportZabbixToObservium({ hostids: [zabbixData.hostid], run_discovery: false, run_poller: false, update_existing: true });
-            addLog("ok", `Exported to Observium: ${zabbixData.host}`, result);
+            const hasErrors = (result.result || []).some(item => item.status === "error");
+            addLog(hasErrors ? "err" : "ok", `Exported to Observium: ${zabbixData.host}`, result);
             setConfirm(null);
           } catch (error) {
             addLog("err", error.message);
@@ -303,22 +295,6 @@ export function TransferPanel({ zabbixData, netboxData, observiumData }) {
           {JSON.stringify(correlation || correlationPayload, null, 2)}
         </div>
       </div>
-
-      <table style={{ marginBottom: 16 }}>
-        <thead>
-          <tr><th>Field</th><th>Zabbix</th><th>NetBox</th><th>Observium</th></tr>
-        </thead>
-        <tbody>
-          {comparisonRows(zabbixData, netboxData, observiumData).map(row => (
-            <tr key={row.field}>
-              <td>{row.field}</td>
-              <td>{row.zabbix}</td>
-              <td>{row.netbox}</td>
-              <td>{row.observium}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
 
       <div className="flex-gap" style={{ marginBottom: 12, flexWrap: "wrap" }}>
         {DIRECTIONS.map(item => (

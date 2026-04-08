@@ -3,7 +3,7 @@ import { api } from "../utils/api";
 import { useLogs } from "../hooks/useLogs";
 import { ConfirmModal } from "./ConfirmModal";
 
-const TABS = ["General", "Interfaces", "IP Addresses", "Comments", "Custom Fields", "Enrichment", "Raw JSON"];
+const TABS = ["General", "Interfaces", "IP Addresses", "Comments", "Custom Fields", "Sync", "Raw JSON"];
 
 const EMPTY_DEVICE = {
   name: "",
@@ -59,12 +59,9 @@ export function NetBoxEditor({ deviceId, onDataReady }) {
   const [sites, setSites] = useState([]);
   const [roles, setRoles] = useState([]);
   const [deviceTypes, setDeviceTypes] = useState([]);
-  const [enrichment, setEnrichment] = useState(null);
-  const [enrichmentLoading, setEnrichmentLoading] = useState(false);
-  const [enrichmentInputs, setEnrichmentInputs] = useState({});
-  const [manualEnrichment, setManualEnrichment] = useState({ asset_tag: "", serial: "" });
-  const [bulkPrimaryPreview, setBulkPrimaryPreview] = useState(null);
-  const [bulkLoading, setBulkLoading] = useState(false);
+  const [syncPreview, setSyncPreview] = useState(null);
+  const [syncLoading, setSyncLoading] = useState(false);
+  const [syncConfig, setSyncConfig] = useState({ enabled: false, field_sources: {} });
 
   useEffect(() => {
     onDataReadyRef.current = onDataReady;
@@ -77,10 +74,8 @@ export function NetBoxEditor({ deviceId, onDataReady }) {
     setAddingIp(false);
     setExistingIpMatches([]);
     setSelectedExistingIpId("");
-    setEnrichment(null);
-    setEnrichmentInputs({});
-    setManualEnrichment({ asset_tag: "", serial: "" });
-    setBulkPrimaryPreview(null);
+    setSyncPreview(null);
+    setSyncConfig({ enabled: false, field_sources: {} });
   }, [deviceId]);
 
   const isCreateMode = activeDeviceId === "new";
@@ -105,7 +100,7 @@ export function NetBoxEditor({ deviceId, onDataReady }) {
         setInterfaces([]);
         setIps([]);
         setComments("");
-        setEnrichment(null);
+        setSyncPreview(null);
         if (onDataReadyRef.current) onDataReadyRef.current(EMPTY_DEVICE);
         setLoading(false);
         return;
@@ -135,42 +130,36 @@ export function NetBoxEditor({ deviceId, onDataReady }) {
     load();
   }, [load]);
 
-  const loadEnrichment = useCallback(async () => {
+  const loadSync = useCallback(async () => {
     if (isCreateMode) {
-      setEnrichment(null);
-      setEnrichmentInputs({});
-      setManualEnrichment({ asset_tag: "", serial: "" });
+      setSyncPreview(null);
+      setSyncConfig({ enabled: false, field_sources: {} });
       return;
     }
-    setEnrichmentLoading(true);
+    setSyncLoading(true);
     try {
-      const response = await api.netboxEnrichment(activeDeviceId);
+      const response = await api.netboxSync(activeDeviceId);
       const result = response.result || null;
-      setEnrichment(result);
-      const nextInputs = {};
-      (result?.suggestions || []).forEach(item => {
-        nextInputs[item.id] = item.proposed_value || "";
-      });
-      setEnrichmentInputs(nextInputs);
-      setManualEnrichment({
-        asset_tag: result?.manual_fields?.asset_tag || "",
-        serial: result?.manual_fields?.serial || "",
+      setSyncPreview(result);
+      setSyncConfig({
+        enabled: !!result?.profile?.enabled,
+        field_sources: result?.profile?.field_sources || {},
       });
     } catch (e) {
-      setEnrichment(null);
+      setSyncPreview(null);
       const message = errorMessage(e);
       if (message.includes("No saved correlation exists for this NetBox device")) {
-        addLog("info", "NetBox enrichment unavailable: save a correlation first");
+        addLog("info", "NetBox sync unavailable: save a correlation first");
       } else {
-        addLog("err", "NetBox enrichment load failed: " + message);
+        addLog("err", "NetBox sync load failed: " + message);
       }
     }
-    setEnrichmentLoading(false);
+    setSyncLoading(false);
   }, [activeDeviceId, addLog, isCreateMode]);
 
   useEffect(() => {
-    loadEnrichment();
-  }, [loadEnrichment]);
+    loadSync();
+  }, [loadSync]);
 
   function updateField(path, value) {
     setDevice(prev => {
@@ -348,56 +337,50 @@ export function NetBoxEditor({ deviceId, onDataReady }) {
     setConfirm(null);
   }
 
-  function setEnrichmentValue(id, value) {
-    setEnrichmentInputs(prev => ({ ...prev, [id]: value }));
+  function setSyncEnabled(value) {
+    setSyncConfig(prev => ({ ...prev, enabled: value }));
   }
 
-  async function applyEnrichmentActions(actions, title) {
+  function setSyncFieldSource(field, source) {
+    setSyncConfig(prev => ({ ...prev, field_sources: { ...prev.field_sources, [field]: source } }));
+  }
+
+  async function saveSyncProfile() {
     setSaving(true);
     try {
-      const response = await api.netboxApplyEnrichment(activeDeviceId, { actions });
-      addLog("ok", `NetBox enrichment applied: ${title}`, response);
-      setConfirm(null);
-      await load();
-      await loadEnrichment();
+      const response = await api.netboxUpdateSync(activeDeviceId, syncConfig);
+      setSyncPreview(response.result?.preview || null);
+      addLog("ok", `NetBox sync profile saved: ${device.name}`, response);
     } catch (e) {
-      addLog("err", "NetBox enrichment failed: " + errorMessage(e));
+      addLog("err", "NetBox sync profile save failed: " + errorMessage(e));
     }
     setSaving(false);
   }
 
-  async function previewBulkPrimaryFix() {
-    setBulkLoading(true);
+  async function runSyncNow() {
+    setSaving(true);
     try {
-      const response = await api.netboxFixPrimaryIpsCorrelated({ dry_run: true });
-      setBulkPrimaryPreview(response.result || []);
-      addLog("ok", `Correlated primary IP preview loaded: ${(response.result || []).length} entries`, response);
-    } catch (e) {
-      addLog("err", "Primary IP bulk preview failed: " + errorMessage(e));
-    }
-    setBulkLoading(false);
-  }
-
-  async function runBulkPrimaryFix() {
-    setBulkLoading(true);
-    try {
-      const response = await api.netboxFixPrimaryIpsCorrelated({ dry_run: false });
-      setBulkPrimaryPreview(response.result || []);
-      addLog("ok", "Correlated primary IP fix executed", response);
+      const response = await api.netboxRunSync(activeDeviceId, syncConfig);
+      setSyncPreview(response.result?.preview || null);
+      addLog("ok", `NetBox sync executed: ${device.name}`, response);
+      setConfirm(null);
       await load();
-      await loadEnrichment();
+      await loadSync();
     } catch (e) {
-      addLog("err", "Primary IP bulk fix failed: " + errorMessage(e));
+      addLog("err", "NetBox sync failed: " + errorMessage(e));
     }
-    setBulkLoading(false);
-    setConfirm(null);
+    setSaving(false);
   }
 
   if (loading) return <div style={{ padding: 20, color: "var(--text3)" }}>Loading...</div>;
   if (!device && !isCreateMode) return <div style={{ padding: 20, color: "var(--error)" }}>Device not found</div>;
 
   const statusVal = device.status?.value || device.status || "active";
-  const actionableFields = new Set((enrichment?.suggestions || []).map(item => item.field));
+  const actionableFields = new Set(
+    Object.entries(syncPreview?.fields || {})
+      .filter(([, meta]) => Object.values(meta?.candidates || {}).some(Boolean))
+      .map(([field]) => field)
+  );
   const fieldHighlightStyle = (field, currentValue) => {
     const text = typeof currentValue === "string" ? currentValue.trim() : currentValue;
     const isEmpty = currentValue === null || currentValue === undefined || text === "";
@@ -737,40 +720,37 @@ export function NetBoxEditor({ deviceId, onDataReady }) {
           </div>
         )}
 
-        {tab === "Enrichment" && !isCreateMode && (
+        {tab === "Sync" && !isCreateMode && (
           <div>
             <div className="section" style={{ marginBottom: 16 }}>
               <div className="section-header" style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-                <span>Correlation Review</span>
-                <button className="btn-secondary" onClick={loadEnrichment} disabled={enrichmentLoading}>
-                  {enrichmentLoading ? "Refreshing..." : "Refresh Analysis"}
+                <span>Synchronization</span>
+                <button className="btn-secondary" onClick={loadSync} disabled={syncLoading}>
+                  {syncLoading ? "Refreshing..." : "Refresh Sources"}
                 </button>
               </div>
               <div className="section-body">
-                {!enrichmentLoading && !enrichment?.correlation && (
+                {!syncLoading && !syncPreview?.correlation && (
                   <div className="notice notice-info" style={{ marginBottom: 0 }}>
-                    This NetBox device does not have a saved correlation with Zabbix and Observium yet. Save a correlation first to unlock guided enrichment.
+                    This NetBox device does not have a saved correlation with Zabbix and Observium yet. Save a correlation first to unlock synchronization.
                   </div>
                 )}
-                {enrichmentLoading && <div style={{ color: "var(--text3)" }}>Analyzing correlated data...</div>}
-                {!enrichmentLoading && enrichment?.correlation && (
+                {syncLoading && <div style={{ color: "var(--text3)" }}>Loading correlated sources...</div>}
+                {!syncLoading && syncPreview?.correlation && (
                   <>
                     <div style={{ marginBottom: 12, color: "var(--text2)" }}>
-                      Correlation #{enrichment.correlation.id} {enrichment.correlation.label ? `· ${enrichment.correlation.label}` : ""}
+                      Correlation #{syncPreview.correlation.id} {syncPreview.correlation.label ? `· ${syncPreview.correlation.label}` : ""}
                     </div>
                     <div className="grid-2">
                       <div className="section" style={{ padding: 12 }}>
                         <div style={{ fontFamily: "var(--font-mono)", fontSize: 12, marginBottom: 8 }}>Zabbix</div>
-                        <div style={{ color: "var(--text2)", fontSize: 12 }}>Host: {enrichment.sources?.zabbix?.host || "-"}</div>
-                        <div style={{ color: "var(--text2)", fontSize: 12 }}>Visible: {enrichment.sources?.zabbix?.name || "-"}</div>
-                        <div style={{ color: "var(--text2)", fontSize: 12 }}>Main IP: {enrichment.sources?.zabbix?.main_ip || "-"}</div>
+                        <div style={{ color: "var(--text2)", fontSize: 12 }}>Host: {syncPreview.sources?.zabbix?.host || "-"}</div>
+                        <div style={{ color: "var(--text2)", fontSize: 12 }}>Visible: {syncPreview.sources?.zabbix?.name || "-"}</div>
                       </div>
                       <div className="section" style={{ padding: 12 }}>
                         <div style={{ fontFamily: "var(--font-mono)", fontSize: 12, marginBottom: 8 }}>Observium</div>
-                        <div style={{ color: "var(--text2)", fontSize: 12 }}>Host: {enrichment.sources?.observium?.hostname || "-"}</div>
-                        <div style={{ color: "var(--text2)", fontSize: 12 }}>sysName: {enrichment.sources?.observium?.sysName || "-"}</div>
-                        <div style={{ color: "var(--text2)", fontSize: 12 }}>IP: {enrichment.sources?.observium?.ip || "-"}</div>
-                        <div style={{ color: "var(--text2)", fontSize: 12 }}>OS/Version: {[enrichment.sources?.observium?.os, enrichment.sources?.observium?.version].filter(Boolean).join(" | ") || "-"}</div>
+                        <div style={{ color: "var(--text2)", fontSize: 12 }}>Host: {syncPreview.sources?.observium?.hostname || "-"}</div>
+                        <div style={{ color: "var(--text2)", fontSize: 12 }}>sysName: {syncPreview.sources?.observium?.sysName || "-"}</div>
                       </div>
                     </div>
                   </>
@@ -778,164 +758,74 @@ export function NetBoxEditor({ deviceId, onDataReady }) {
               </div>
             </div>
 
-            {enrichment?.correlation && (
+            {syncPreview?.correlation && (
               <>
                 <div className="section" style={{ marginBottom: 16 }}>
-                  <div className="section-header"><span>Direct Fields</span></div>
+                  <div className="section-header"><span>Profile</span></div>
                   <div className="section-body">
-                    <div className="grid-2" style={{ marginBottom: 8 }}>
-                      <div className="field-row">
-                        <label>Asset Tag</label>
-                        <input value={manualEnrichment.asset_tag} onChange={e => setManualEnrichment(prev => ({ ...prev, asset_tag: e.target.value }))} />
-                      </div>
-                      <div className="field-row">
-                        <label>Serial</label>
-                        <input value={manualEnrichment.serial} onChange={e => setManualEnrichment(prev => ({ ...prev, serial: e.target.value }))} />
-                      </div>
+                    <div className="field-row" style={{ marginBottom: 12 }}>
+                      <label>Enable Synchronization Profile</label>
+                      <select value={syncConfig.enabled ? "1" : "0"} onChange={e => setSyncEnabled(e.target.value === "1")}>
+                        <option value="0">Disabled</option>
+                        <option value="1">Enabled</option>
+                      </select>
                     </div>
-                    <div className="flex-gap">
-                      <button
-                        className="btn-primary"
-                        onClick={() => {
-                          const actions = [];
-                          if (manualEnrichment.asset_tag !== (enrichment?.manual_fields?.asset_tag || "")) {
-                            actions.push({ action_type: "set_asset_tag", value: manualEnrichment.asset_tag });
-                          }
-                          if (manualEnrichment.serial !== (enrichment?.manual_fields?.serial || "")) {
-                            actions.push({ action_type: "set_serial", value: manualEnrichment.serial });
-                          }
-                          if (!actions.length) {
-                            addLog("err", "No manual field changes to apply");
-                            return;
-                          }
-                          setConfirm({
-                            title: `Apply Manual NetBox Fields: ${device.name}`,
-                            payload: { actions },
-                            onConfirm: payload => applyEnrichmentActions(payload.actions, "manual fields"),
-                          });
-                        }}
-                      >
-                        Preview & Save Direct Fields
-                      </button>
+                    <div className="notice notice-info" style={{ marginBottom: 8 }}>
+                      Choose the preferred source for each field. `platform` and `location` create missing NetBox objects automatically. `primary_ip4` creates or reuses the IP in NetBox and assigns it as the device primary IP.
                     </div>
-                  </div>
-                </div>
-
-                <div className="section" style={{ marginBottom: 16 }}>
-                  <div className="section-header" style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-                    <span>Suggested Enrichment</span>
-                    <button
-                      className="btn-primary"
-                      disabled={!enrichment?.suggestions?.length}
-                      onClick={() => {
-                        const actions = (enrichment?.suggestions || []).map(item => ({
-                          action_type: item.action_type,
-                          value: enrichmentInputs[item.id] ?? item.proposed_value ?? "",
-                          metadata: { id: item.id, field: item.field, source: item.source },
-                        }));
-                        setConfirm({
-                          title: `Apply All Suggestions: ${device.name}`,
-                          payload: { actions },
-                          onConfirm: payload => applyEnrichmentActions(payload.actions, "all suggestions"),
-                        });
-                      }}
-                    >
-                      Preview & Apply All
-                    </button>
-                  </div>
-                  <div className="section-body">
-                    {!enrichment?.suggestions?.length && (
-                      <div className="notice notice-info" style={{ marginBottom: 0 }}>
-                        No enrichment suggestions are currently pending for this correlated device.
-                      </div>
-                    )}
-                    {(enrichment?.suggestions || []).map(item => (
-                      <div key={item.id} className="section" style={{ padding: 12, marginBottom: 12 }}>
-                        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, marginBottom: 8 }}>
-                          <div>
-                            <div style={{ fontWeight: 600 }}>{item.label}</div>
-                            <div style={{ fontSize: 11, color: "var(--text3)" }}>
-                              Source: {item.source} · Target: {item.target_section} {item.requires_create ? "· creates missing NetBox object automatically" : ""}
-                            </div>
-                          </div>
-                          <span className={`tag ${item.confidence === "high" ? "tag-ok" : "tag-warn"}`}>{item.confidence}</span>
-                        </div>
-                        <div className="grid-2" style={{ marginBottom: 8 }}>
+                    {(Object.entries(syncPreview.fields || [])).map(([field, meta]) => (
+                      <div key={field} className="section" style={{ padding: 12, marginBottom: 12 }}>
+                        <div style={{ display: "grid", gridTemplateColumns: "160px 160px 1fr 1fr 1fr", gap: 10, alignItems: "end" }}>
                           <div className="field-row">
-                            <label>Current Value</label>
-                            <input value={item.current_value || ""} readOnly />
+                            <label>Field</label>
+                            <input value={field} readOnly />
                           </div>
                           <div className="field-row">
-                            <label>Proposed Value</label>
-                            {item.field === "comments" || item.field === "description" ? (
-                              <textarea
-                                value={enrichmentInputs[item.id] ?? item.proposed_value ?? ""}
-                                onChange={e => setEnrichmentValue(item.id, e.target.value)}
-                                style={{ height: 84, resize: "vertical" }}
-                              />
+                            <label>Source</label>
+                            <select value={syncConfig.field_sources[field] || meta.selected_source || ""} onChange={e => setSyncFieldSource(field, e.target.value)}>
+                              <option value="zabbix">Zabbix</option>
+                              <option value="observium">Observium</option>
+                            </select>
+                          </div>
+                          <div className="field-row">
+                            <label>Current NetBox</label>
+                            <input value={meta.current_value || ""} readOnly />
+                          </div>
+                          <div className="field-row">
+                            <label>Zabbix</label>
+                            {field === "description" || field === "comments" ? (
+                              <textarea value={meta.candidates?.zabbix || ""} readOnly style={{ height: 82, resize: "vertical" }} />
                             ) : (
-                              <input
-                                value={enrichmentInputs[item.id] ?? item.proposed_value ?? ""}
-                                onChange={e => setEnrichmentValue(item.id, e.target.value)}
-                              />
+                              <input value={meta.candidates?.zabbix || ""} readOnly />
+                            )}
+                          </div>
+                          <div className="field-row">
+                            <label>Observium</label>
+                            {field === "description" || field === "comments" ? (
+                              <textarea value={meta.candidates?.observium || ""} readOnly style={{ height: 82, resize: "vertical" }} />
+                            ) : (
+                              <input value={meta.candidates?.observium || ""} readOnly />
                             )}
                           </div>
                         </div>
-                        {item.note && (
-                          <div className="notice notice-info" style={{ marginBottom: 8 }}>
-                            {item.note}
-                          </div>
-                        )}
-                        <div className="flex-gap">
-                          <button
-                            className="btn-primary"
-                            onClick={() => setConfirm({
-                              title: `${item.label}: ${device.name}`,
-                              payload: {
-                                actions: [{
-                                  action_type: item.action_type,
-                                  value: enrichmentInputs[item.id] ?? item.proposed_value ?? "",
-                                  metadata: { id: item.id, field: item.field, source: item.source },
-                                }],
-                              },
-                              onConfirm: payload => applyEnrichmentActions(payload.actions, item.label),
-                            })}
-                          >
-                            Preview & Apply
-                          </button>
-                        </div>
                       </div>
                     ))}
-                  </div>
-                </div>
-
-                <div className="section">
-                  <div className="section-header"><span>Batch Primary IPv4 Fix</span></div>
-                  <div className="section-body">
-                    <div className="notice notice-info" style={{ marginBottom: 8 }}>
-                      This routine reviews all saved NetBox/Zabbix correlations and fills missing NetBox primary IPv4 values from the main Zabbix interface.
-                    </div>
-                    <div className="flex-gap" style={{ marginBottom: 12 }}>
-                      <button className="btn-secondary" onClick={previewBulkPrimaryFix} disabled={bulkLoading}>
-                        {bulkLoading ? "Working..." : "Preview Correlated Fix"}
+                    <div className="flex-gap" style={{ marginTop: 12 }}>
+                      <button className="btn-secondary" onClick={saveSyncProfile} disabled={saving}>
+                        Save Sync Profile
                       </button>
                       <button
                         className="btn-primary"
                         onClick={() => setConfirm({
-                          title: "Apply Correlated Primary IPv4 Fix",
-                          payload: { dry_run: false },
-                          onConfirm: runBulkPrimaryFix,
+                          title: `Run NetBox Sync: ${device.name}`,
+                          payload: syncConfig,
+                          onConfirm: runSyncNow,
                         })}
-                        disabled={bulkLoading}
+                        disabled={saving}
                       >
-                        Apply All Correlated Primary IPv4
+                        Preview & Run Sync
                       </button>
                     </div>
-                    {bulkPrimaryPreview && (
-                      <div className="json-preview" style={{ maxHeight: 260 }}>
-                        {JSON.stringify(bulkPrimaryPreview, null, 2)}
-                      </div>
-                    )}
                   </div>
                 </div>
               </>
@@ -955,7 +845,7 @@ export function NetBoxEditor({ deviceId, onDataReady }) {
         )}
       </div>
 
-      {tab !== "Raw JSON" && tab !== "Interfaces" && tab !== "IP Addresses" && tab !== "Enrichment" && (
+      {tab !== "Raw JSON" && tab !== "Interfaces" && tab !== "IP Addresses" && tab !== "Sync" && (
         <div style={{ padding: "12px 16px", borderTop: "1px solid var(--border)", display: "flex", gap: 8, flexWrap: "wrap" }}>
           <button className="btn-primary" onClick={() => {
             const payload = buildGeneralPayload();

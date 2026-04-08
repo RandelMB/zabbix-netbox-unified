@@ -102,6 +102,38 @@ function panelTag(type) {
   return <span className="tag" style={{ background: "rgba(255,172,48,0.18)", color: "#ffac30", borderColor: "rgba(255,172,48,0.45)" }}>OBSERVIUM</span>;
 }
 
+function linkedPlatformBadges(sourceName, meta) {
+  if (!meta) return null;
+  if (meta.kind !== "saved") return <span className={`correlation-pill ${meta.kind}`}>auto</span>;
+  const items = Object.keys(meta.items || {}).filter(item => item !== sourceName);
+  if (!items.length) return null;
+  const badgeStyle = (type) => {
+    if (type === "zabbix") return { color: "#ff6b6b", border: "1px solid rgba(255,107,107,0.45)", background: "rgba(255,107,107,0.14)" };
+    if (type === "netbox") return { color: "#2dd4ff", border: "1px solid rgba(45,212,255,0.45)", background: "rgba(45,212,255,0.14)" };
+    return { color: "#ffac30", border: "1px solid rgba(255,172,48,0.45)", background: "rgba(255,172,48,0.16)" };
+  };
+  const badgeLabel = (type) => (type === "zabbix" ? "Z" : type === "netbox" ? "N" : "O");
+  return (
+    <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+      {items.map((item, index) => (
+        <span key={item} style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+          <span className="correlation-pill saved" style={badgeStyle(item)}>{badgeLabel(item)}</span>
+          {index < items.length - 1 && <span style={{ color: "var(--text3)", fontSize: 10, fontFamily: "var(--font-mono)" }}>y</span>}
+        </span>
+      ))}
+    </span>
+  );
+}
+
+function linkStyle() {
+  return {
+    color: "var(--text)",
+    textDecoration: "underline",
+    textDecorationColor: "rgba(0,153,255,0.45)",
+    textUnderlineOffset: "2px",
+  };
+}
+
 export function DeviceListPage({ onOpenDevice, active, uiPrefs }) {
   const { addLog } = useLogs();
   const [zHosts, setZHosts] = useState([]);
@@ -115,6 +147,7 @@ export function DeviceListPage({ onOpenDevice, active, uiPrefs }) {
   const [selectedNetbox, setSelectedNetbox] = useState({});
   const [selectedObservium, setSelectedObservium] = useState({});
   const [source, setSource] = useState("all");
+  const [downloadingDrawio, setDownloadingDrawio] = useState(false);
 
   async function loadCorrelations() {
     try {
@@ -174,6 +207,17 @@ export function DeviceListPage({ onOpenDevice, active, uiPrefs }) {
     loadCorrelations();
   }
 
+  async function downloadInventoryDrawio() {
+    setDownloadingDrawio(true);
+    try {
+      await api.downloadInventoryDrawio(archiveView.netbox);
+      addLog("ok", `Inventory draw.io downloaded using NetBox filter: ${archiveView.netbox}`);
+    } catch (error) {
+      addLog("err", `Inventory draw.io download failed: ${error.message}`);
+    }
+    setDownloadingDrawio(false);
+  }
+
   async function toggleArchive(sourceName, item, archived) {
     try {
       if (archived) {
@@ -203,7 +247,10 @@ export function DeviceListPage({ onOpenDevice, active, uiPrefs }) {
       const updated = response.result.filter(item => item.status === "updated").length;
       const skipped = response.result.filter(item => item.status === "skipped").length;
       const errors = response.result.filter(item => item.status === "error").length;
-      addLog("ok", `Manual export to Observium finished. created=${created} updated=${updated} skipped=${skipped} errors=${errors}`, response);
+      const detailLines = (response.result || [])
+        .filter(item => item.status === "error" || item.snmp_check?.status === "error")
+        .map(item => `${item.host || item.hostname || item.hostid}: ${item.message || item.snmp_check?.message || "warning"}`);
+      addLog(errors > 0 ? "err" : "ok", `Manual export to Observium finished. created=${created} updated=${updated} skipped=${skipped} errors=${errors}`, detailLines.length ? detailLines.join("\n") : response);
       loadObservium();
     } catch (error) {
       addLog("err", `Manual export failed: ${error.message}`);
@@ -337,6 +384,9 @@ export function DeviceListPage({ onOpenDevice, active, uiPrefs }) {
           {uiPrefs?.correlationMode !== "saved" && uiPrefs?.correlationMode !== "off" && <span className="correlation-pill auto">auto {autoCount}</span>}
         </div>
         <div style={{ marginLeft: "auto", display: "flex", gap: 8 }}>
+          <button className="btn-secondary" onClick={downloadInventoryDrawio} disabled={downloadingDrawio}>
+            {downloadingDrawio ? "Preparing draw.io..." : "Download draw.io"}
+          </button>
           <div style={{ display: "flex", background: "var(--bg3)", border: "1px solid var(--border)", borderRadius: "var(--radius)", overflow: "hidden" }}>
             {["all", "zabbix", "netbox", "observium"].map(item => (
               <button
@@ -392,8 +442,14 @@ export function DeviceListPage({ onOpenDevice, active, uiPrefs }) {
                           <td><input type="checkbox" checked={!!selectedZabbix[host.hostid]} onChange={event => setSelectedZabbix(prev => ({ ...prev, [host.hostid]: event.target.checked }))} /></td>
                           <td>
                             <div style={{ fontWeight: 600, display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-                              <span>{host.host}</span>
-                              {meta && <span className={`correlation-pill ${meta.kind}`}>{meta.kind === "saved" ? "linked" : "auto"}</span>}
+                              {host.ui_url ? (
+                                <a href={host.ui_url} target="_blank" rel="noreferrer" style={linkStyle()} title="Open in Zabbix">
+                                  {host.host}
+                                </a>
+                              ) : (
+                                <span>{host.host}</span>
+                              )}
+                              {meta && linkedPlatformBadges("zabbix", meta)}
                             </div>
                             <div style={{ color: "var(--text3)", fontSize: 10 }}>{host.name !== host.host ? host.name : ""}</div>
                           </td>
@@ -441,7 +497,7 @@ export function DeviceListPage({ onOpenDevice, active, uiPrefs }) {
                       return (
                       <tr key={device.id} className={meta ? `row-correlation-${meta.kind}` : ""}>
                         <td><input type="checkbox" checked={!!selectedNetbox[device.id]} onChange={event => setSelectedNetbox(prev => ({ ...prev, [device.id]: event.target.checked }))} /></td>
-                        <td><div style={{ fontWeight: 600, display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}><span>{device.name}</span>{meta && <span className={`correlation-pill ${meta.kind}`}>{meta.kind === "saved" ? "linked" : "auto"}</span>}</div><div style={{ color: "var(--text3)", fontSize: 10 }}>{device.device_type?.display || ""}</div></td>
+                        <td><div style={{ fontWeight: 600, display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>{device.display_url ? <a href={device.display_url} target="_blank" rel="noreferrer" style={linkStyle()} title="Open in NetBox">{device.name}</a> : <span>{device.name}</span>}{meta && linkedPlatformBadges("netbox", meta)}</div><div style={{ color: "var(--text3)", fontSize: 10 }}>{device.device_type?.display || ""}</div></td>
                         <td style={{ color: "var(--accent2)" }}>{device.primary_ip4?.address || "-"}</td>
                         <td><span className={`tag ${device.archived ? "tag-warn" : device.status?.value === "active" ? "tag-ok" : "tag-warn"}`} style={{ fontSize: 9 }}>{device.archived ? "archived" : (device.status?.value || device.status)}</span></td>
                         <td><div className="flex-gap"><button className="btn-secondary" style={{ padding: "2px 8px", fontSize: 10 }} onClick={() => openWithCorrelation("netbox", device.id, device.name)}>{meta ? "Open Group" : "Open"}</button><button className="btn-secondary" style={{ padding: "2px 8px", fontSize: 10 }} onClick={() => toggleArchive("netbox", { id: device.id, label: device.name }, device.archived)}>{device.archived ? "Restore" : "Archive"}</button></div></td>
@@ -479,7 +535,7 @@ export function DeviceListPage({ onOpenDevice, active, uiPrefs }) {
                       return (
                       <tr key={device.device_id} className={meta ? `row-correlation-${meta.kind}` : ""}>
                         <td><input type="checkbox" checked={!!selectedObservium[device.device_id]} onChange={event => setSelectedObservium(prev => ({ ...prev, [device.device_id]: event.target.checked }))} /></td>
-                        <td><div style={{ fontWeight: 600, display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}><span>{device.hostname}</span>{meta && <span className={`correlation-pill ${meta.kind}`}>{meta.kind === "saved" ? "linked" : "auto"}</span>}</div><div style={{ color: "var(--text3)", fontSize: 10 }}>{device.sysName || device.ip || ""}</div></td>
+                        <td><div style={{ fontWeight: 600, display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>{device.web_url ? <a href={device.web_url} target="_blank" rel="noreferrer" style={linkStyle()} title="Open in Observium">{device.hostname}</a> : <span>{device.hostname}</span>}{meta && linkedPlatformBadges("observium", meta)}</div><div style={{ color: "var(--text3)", fontSize: 10 }}>{device.sysName || device.ip || ""}</div></td>
                         <td style={{ color: "var(--accent2)" }}>{device.snmp_version}/{device.snmp_port}</td>
                         <td><span className={`tag ${device.archived ? "tag-warn" : device.disabled ? "tag-warn" : "tag-ok"}`} style={{ fontSize: 9 }}>{device.archived ? "archived" : device.disabled ? "disabled" : (device.status ? "up" : "down")}</span></td>
                         <td><div className="flex-gap"><button className="btn-secondary" style={{ padding: "2px 8px", fontSize: 10 }} onClick={() => openWithCorrelation("observium", device.device_id, device.hostname)}>{meta ? "Open Group" : "Open"}</button><button className="btn-secondary" style={{ padding: "2px 8px", fontSize: 10 }} onClick={() => toggleArchive("observium", { id: device.device_id, label: device.hostname }, device.archived)}>{device.archived ? "Restore" : "Archive"}</button></div></td>

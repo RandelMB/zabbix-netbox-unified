@@ -29,6 +29,24 @@ async function req(method, path, body) {
   return data;
 }
 
+async function download(path, filename) {
+  const r = await fetch(`${BASE}${path}`);
+  if (!r.ok) {
+    const data = await r.json().catch(() => ({}));
+    const message = formatErrorDetail(data.detail) || formatErrorDetail(data) || `GET ${path} failed with status ${r.status}`;
+    throw new Error(message);
+  }
+  const blob = await r.blob();
+  const url = window.URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  window.URL.revokeObjectURL(url);
+}
+
 export const api = {
   get: (p) => req("GET", p),
   post: (p, b) => req("POST", p, b),
@@ -80,6 +98,10 @@ export const api = {
   netboxPlatforms: () => req("GET", "/api/netbox/platforms"),
   netboxLocations: (siteId = "") => req("GET", `/api/netbox/locations${siteId ? `?site_id=${encodeURIComponent(siteId)}` : ""}`),
   netboxRoles: () => req("GET", "/api/netbox/roles"),
+  downloadInventoryDrawio: (archived = "exclude") => download(`/api/netbox/inventory.drawio?archived=${encodeURIComponent(archived)}`, "inventory.drawio"),
+  netboxSync: (deviceId) => req("GET", `/api/netbox/devices/${deviceId}/sync`),
+  netboxUpdateSync: (deviceId, b) => req("PUT", `/api/netbox/devices/${deviceId}/sync`, b),
+  netboxRunSync: (deviceId, b) => req("POST", `/api/netbox/devices/${deviceId}/sync/run`, b),
   netboxEnrichment: (deviceId) => req("GET", `/api/netbox/devices/${deviceId}/enrichment`),
   netboxApplyEnrichment: (deviceId, b) => req("POST", `/api/netbox/devices/${deviceId}/enrichment/apply`, b),
   netboxFixPrimaryIpsCorrelated: (b = {}) => req("POST", "/api/netbox/enrichment/fix-primary-ip4-correlated", b),
