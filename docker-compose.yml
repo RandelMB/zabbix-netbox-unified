@@ -7,7 +7,7 @@ services:
     env_file:
       - .env
     environment:
-      ZNEDITOR_DEPLOY_MARKER: zabbix-search-macro-drawio-v1
+      ZNEDITOR_DEPLOY_MARKER: sync-drawio-assettag-v1
     volumes:
       - ./backend:/app
       - /var/run/docker.sock:/var/run/docker.sock

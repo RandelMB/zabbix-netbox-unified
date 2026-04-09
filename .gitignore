@@ -5,3 +5,10 @@ __pycache__/
 frontend/build/
 .DS_Store
 data/
+inventory.drawio
+*.log
+*.db
+*.sqlite
+*.sqlite3
+*.swp
+backend/config/company.local.json

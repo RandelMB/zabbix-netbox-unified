@@ -9,6 +9,10 @@ Editor visual avanzado para gestión manual y transferencia de datos entre Zabbi
 cp .env.example .env
 # Editar .env con tus URLs y tokens
 
+# 1.1 Opcional: branding y exclusiones privadas
+cp backend/config/company.example.json backend/config/company.local.json
+# Editar company.local.json con nombres y reglas internas
+
 # 2. Levantar
 docker compose up --build
 
@@ -23,6 +27,9 @@ docker compose up --build
 zabbix-netbox-editor/
 ├── backend/
 │   ├── main.py              # FastAPI — todos los endpoints
+│   ├── config/
+│   │   ├── company.example.json
+│   │   └── company.local.json   # local, privado, ignorado por Git
 │   ├── requirements.txt
 │   └── Dockerfile
 ├── frontend/
@@ -132,3 +139,18 @@ zabbix-netbox-editor/
 - Las variables `.env` son el fallback de inicio
 - La UI puede sobreescribir credenciales en runtime via `/api/credentials`
 - Usar HTTPS en producción (configurar en nginx o via proxy externo)
+
+## Publicación en GitHub
+
+No subir estos archivos:
+
+- `.env`
+- `data/`
+- `inventory.drawio`
+- `*.log`
+- `backend/config/company.local.json`
+
+Mantén en Git solo las plantillas públicas:
+
+- `.env.example`
+- `backend/config/company.example.json`

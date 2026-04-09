@@ -1,0 +1,18 @@
+{
+  "branding": {
+    "company_name": "Example Company",
+    "app_name": "ZN",
+    "app_accent": "Editor",
+    "app_subtitle": "ZABBIX · NETBOX · OBSERVIUM",
+    "support_label": "manual control"
+  },
+  "publishing": {
+    "sensitive_paths": [
+      ".env",
+      "data/",
+      "inventory.drawio",
+      "*.log",
+      "backend/config/company.local.json"
+    ]
+  }
+}

@@ -204,28 +204,31 @@ export function NetBoxEditor({ deviceId, onDataReady }) {
 
   function buildGeneralPayload() {
     if (isCreateMode) {
-      return {
+      const payload = {
         name: device.name,
         status: device.status,
         site: Number(device.site),
         role: Number(device.role),
         device_type: Number(device.device_type),
-        asset_tag: device.asset_tag || "",
         serial: device.serial || "",
         description: device.description || "",
         comments,
         custom_fields: device.custom_fields || {},
       };
+      if ((device.asset_tag || "").trim()) payload.asset_tag = device.asset_tag.trim();
+      return payload;
     }
-    return {
+    const payload = {
       name: device.name,
       status: device.status?.value || device.status,
-      asset_tag: device.asset_tag || "",
       serial: device.serial || "",
       description: device.description || "",
       comments,
       custom_fields: device.custom_fields || {},
     };
+    const assetTag = (device.asset_tag || "").trim();
+    payload.asset_tag = assetTag || null;
+    return payload;
   }
 
   function buildCommentFromIp() {
@@ -771,7 +774,7 @@ export function NetBoxEditor({ deviceId, onDataReady }) {
                       </select>
                     </div>
                     <div className="notice notice-info" style={{ marginBottom: 8 }}>
-                      Choose the preferred source for each field. `platform` and `location` create missing NetBox objects automatically. `primary_ip4` creates or reuses the IP in NetBox and assigns it as the device primary IP.
+                      Choose the preferred source for each field. `platform` creates the missing NetBox platform automatically. `primary_ip4` creates or reuses the IP in NetBox and assigns it as the device primary IP. `description` only pulls the OS version string.
                     </div>
                     {(Object.entries(syncPreview.fields || [])).map(([field, meta]) => (
                       <div key={field} className="section" style={{ padding: 12, marginBottom: 12 }}>
@@ -793,7 +796,7 @@ export function NetBoxEditor({ deviceId, onDataReady }) {
                           </div>
                           <div className="field-row">
                             <label>Zabbix</label>
-                            {field === "description" || field === "comments" ? (
+                            {field === "description" ? (
                               <textarea value={meta.candidates?.zabbix || ""} readOnly style={{ height: 82, resize: "vertical" }} />
                             ) : (
                               <input value={meta.candidates?.zabbix || ""} readOnly />
@@ -801,7 +804,7 @@ export function NetBoxEditor({ deviceId, onDataReady }) {
                           </div>
                           <div className="field-row">
                             <label>Observium</label>
-                            {field === "description" || field === "comments" ? (
+                            {field === "description" ? (
                               <textarea value={meta.candidates?.observium || ""} readOnly style={{ height: 82, resize: "vertical" }} />
                             ) : (
                               <input value={meta.candidates?.observium || ""} readOnly />

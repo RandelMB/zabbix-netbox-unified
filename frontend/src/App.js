@@ -4,6 +4,7 @@ import { LogProvider } from "./hooks/useLogs";
 import { DeviceListPage } from "./pages/DeviceListPage";
 import { WorkspacePage } from "./pages/WorkspacePage";
 import { SettingsPage } from "./pages/SettingsPage";
+import { api } from "./utils/api";
 
 const THEME_PRESETS = {
   midnight_ops: {
@@ -94,6 +95,19 @@ const DEFAULT_UI_PREFS = {
   highlightIntensity: "strong",
 };
 
+const DEFAULT_COMPANY_PROFILE = {
+  branding: {
+    app_name: "ZN",
+    app_accent: "Editor",
+    app_subtitle: "ZABBIX · NETBOX · OBSERVIUM",
+    support_label: "manual control",
+    company_name: "Example Company",
+  },
+  publishing: {
+    sensitive_paths: [".env", "data/", "inventory.drawio", "*.log", "backend/config/company.local.json"],
+  },
+};
+
 function loadUiPrefs() {
   try {
     const parsed = JSON.parse(window.localStorage.getItem("zneditor_ui_prefs") || "{}");
@@ -119,11 +133,18 @@ function AppInner() {
   const [page, setPage] = useState("inventory");
   const [pendingTab, setPendingTab] = useState(null);
   const [uiPrefs, setUiPrefs] = useState(loadUiPrefs);
+  const [companyProfile, setCompanyProfile] = useState(DEFAULT_COMPANY_PROFILE);
 
   useEffect(() => {
     applyTheme(uiPrefs.theme, uiPrefs.highlightIntensity);
     window.localStorage.setItem("zneditor_ui_prefs", JSON.stringify(uiPrefs));
   }, [uiPrefs]);
+
+  useEffect(() => {
+    api.companyProfile()
+      .then(data => setCompanyProfile(data.result || DEFAULT_COMPANY_PROFILE))
+      .catch(() => {});
+  }, []);
 
   function openDevice(device) {
     setPendingTab(device);
@@ -163,10 +184,11 @@ function AppInner() {
           </div>
           <div>
             <div style={{ fontFamily: "var(--font-mono)", fontWeight: 700, fontSize: 13, color: "var(--text)", lineHeight: 1.2 }}>
-              ZN<span style={{ color: "var(--accent)" }}>Editor</span>
+              {(companyProfile.branding?.app_name || DEFAULT_COMPANY_PROFILE.branding.app_name)}
+              <span style={{ color: "var(--accent)" }}>{companyProfile.branding?.app_accent || DEFAULT_COMPANY_PROFILE.branding.app_accent}</span>
             </div>
             <div style={{ fontFamily: "var(--font-mono)", fontSize: 9, color: "var(--text3)", letterSpacing: "0.1em" }}>
-              ZABBIX · NETBOX · OBSERVIUM
+              {companyProfile.branding?.app_subtitle || DEFAULT_COMPANY_PROFILE.branding.app_subtitle}
             </div>
           </div>
         </div>
@@ -204,7 +226,7 @@ function AppInner() {
           <span style={{ color: "var(--text3)", fontSize: 12 }}>⇄</span>
           <span className="tag" style={{ fontSize: 10, background: "rgba(255,172,48,0.18)", color: "#ffac30", borderColor: "rgba(255,172,48,0.45)" }}>Observium</span>
           <span style={{ marginLeft: 8, fontFamily: "var(--font-mono)", fontSize: 9, color: "var(--text3)" }}>
-            manual control
+            {companyProfile.branding?.support_label || DEFAULT_COMPANY_PROFILE.branding.support_label}
           </span>
         </div>
       </nav>
@@ -217,7 +239,7 @@ function AppInner() {
           <WorkspacePage pendingTab={page === "workspace" ? pendingTab : null} onPendingConsumed={() => setPendingTab(null)} />
         </div>
         <div style={{ display: page === "settings" ? "block" : "none", height: "100%", overflow: "auto" }}>
-          <SettingsPage uiPrefs={uiPrefs} onUiPrefsChange={setUiPrefs} themePresets={THEME_PRESETS} />
+          <SettingsPage uiPrefs={uiPrefs} onUiPrefsChange={setUiPrefs} themePresets={THEME_PRESETS} companyProfile={companyProfile} />
         </div>
       </div>
     </div>

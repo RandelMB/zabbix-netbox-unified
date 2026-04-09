@@ -108,18 +108,27 @@ function linkedPlatformBadges(sourceName, meta) {
   const items = Object.keys(meta.items || {}).filter(item => item !== sourceName);
   if (!items.length) return null;
   const badgeStyle = (type) => {
-    if (type === "zabbix") return { color: "#ff6b6b", border: "1px solid rgba(255,107,107,0.45)", background: "rgba(255,107,107,0.14)" };
-    if (type === "netbox") return { color: "#2dd4ff", border: "1px solid rgba(45,212,255,0.45)", background: "rgba(45,212,255,0.14)" };
-    return { color: "#ffac30", border: "1px solid rgba(255,172,48,0.45)", background: "rgba(255,172,48,0.16)" };
+    const base = {
+      display: "inline-flex",
+      alignItems: "center",
+      justifyContent: "center",
+      width: 16,
+      height: 16,
+      padding: 0,
+      borderRadius: 2,
+      fontSize: 8,
+      fontWeight: 700,
+      lineHeight: 1,
+    };
+    if (type === "zabbix") return { ...base, color: "#ff6b6b", border: "1px solid rgba(255,107,107,0.45)", background: "rgba(255,107,107,0.14)" };
+    if (type === "netbox") return { ...base, color: "#2dd4ff", border: "1px solid rgba(45,212,255,0.45)", background: "rgba(45,212,255,0.14)" };
+    return { ...base, color: "#ffac30", border: "1px solid rgba(255,172,48,0.45)", background: "rgba(255,172,48,0.16)" };
   };
   const badgeLabel = (type) => (type === "zabbix" ? "Z" : type === "netbox" ? "N" : "O");
   return (
-    <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
-      {items.map((item, index) => (
-        <span key={item} style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
-          <span className="correlation-pill saved" style={badgeStyle(item)}>{badgeLabel(item)}</span>
-          {index < items.length - 1 && <span style={{ color: "var(--text3)", fontSize: 10, fontFamily: "var(--font-mono)" }}>y</span>}
-        </span>
+    <span style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+      {items.map((item) => (
+        <span key={item} className="correlation-pill saved" style={badgeStyle(item)}>{badgeLabel(item)}</span>
       ))}
     </span>
   );
