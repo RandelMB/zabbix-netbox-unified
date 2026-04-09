@@ -362,6 +362,14 @@ export function DeviceListPage({ onOpenDevice, active, uiPrefs }) {
     addLog("ok", `${meta.kind === "saved" ? "Correlation group" : "Auto correlation"} opened in workspace: ${labelWithMeta(label, meta)}`);
   }
 
+  function openInventoryItem(sourceName, itemId, label) {
+    if (sourceName === "zabbix") {
+      onOpenDevice({ type: sourceName, id: itemId, label });
+      return;
+    }
+    openWithCorrelation(sourceName, itemId, label);
+  }
+
   const sections = ["zabbix", "netbox", "observium"].filter(item => source === "all" || source === item);
   const columns = sections.length === 1 ? "1fr" : sections.length === 2 ? "1fr 1fr" : "1fr 1fr 1fr";
 
@@ -466,7 +474,7 @@ export function DeviceListPage({ onOpenDevice, active, uiPrefs }) {
                           <td><span className={`tag ${host.archived ? "tag-warn" : host.status === "0" ? "tag-ok" : "tag-err"}`} style={{ fontSize: 9 }}>{host.archived ? "archived" : host.status === "0" ? "on" : "off"}</span></td>
                           <td>
                             <div className="flex-gap">
-                              <button className="btn-secondary" style={{ padding: "2px 8px", fontSize: 10 }} onClick={() => openWithCorrelation("zabbix", host.hostid, host.host)}>{meta ? "Open Group" : "Open"}</button>
+                              <button className="btn-secondary" style={{ padding: "2px 8px", fontSize: 10 }} onClick={() => openInventoryItem("zabbix", host.hostid, host.host)}>Open</button>
                               <button className="btn-secondary" style={{ padding: "2px 8px", fontSize: 10 }} onClick={() => exportSelectedToObservium([host.hostid])}>Export OBS</button>
                               <button className="btn-secondary" style={{ padding: "2px 8px", fontSize: 10 }} onClick={() => toggleArchive("zabbix", { id: host.hostid, label: host.host, details: { host: host.host } }, host.archived)}>{host.archived ? "Restore" : "Archive"}</button>
                             </div>
@@ -509,7 +517,7 @@ export function DeviceListPage({ onOpenDevice, active, uiPrefs }) {
                         <td><div style={{ fontWeight: 600, display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>{device.display_url ? <a href={device.display_url} target="_blank" rel="noreferrer" style={linkStyle()} title="Open in NetBox">{device.name}</a> : <span>{device.name}</span>}{meta && linkedPlatformBadges("netbox", meta)}</div><div style={{ color: "var(--text3)", fontSize: 10 }}>{device.device_type?.display || ""}</div></td>
                         <td style={{ color: "var(--accent2)" }}>{device.primary_ip4?.address || "-"}</td>
                         <td><span className={`tag ${device.archived ? "tag-warn" : device.status?.value === "active" ? "tag-ok" : "tag-warn"}`} style={{ fontSize: 9 }}>{device.archived ? "archived" : (device.status?.value || device.status)}</span></td>
-                        <td><div className="flex-gap"><button className="btn-secondary" style={{ padding: "2px 8px", fontSize: 10 }} onClick={() => openWithCorrelation("netbox", device.id, device.name)}>{meta ? "Open Group" : "Open"}</button><button className="btn-secondary" style={{ padding: "2px 8px", fontSize: 10 }} onClick={() => toggleArchive("netbox", { id: device.id, label: device.name }, device.archived)}>{device.archived ? "Restore" : "Archive"}</button></div></td>
+                        <td><div className="flex-gap"><button className="btn-secondary" style={{ padding: "2px 8px", fontSize: 10 }} onClick={() => openInventoryItem("netbox", device.id, device.name)}>{meta ? "Open Group" : "Open"}</button><button className="btn-secondary" style={{ padding: "2px 8px", fontSize: 10 }} onClick={() => toggleArchive("netbox", { id: device.id, label: device.name }, device.archived)}>{device.archived ? "Restore" : "Archive"}</button></div></td>
                       </tr>
                     )})}
                   </tbody>
@@ -547,7 +555,7 @@ export function DeviceListPage({ onOpenDevice, active, uiPrefs }) {
                         <td><div style={{ fontWeight: 600, display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>{device.web_url ? <a href={device.web_url} target="_blank" rel="noreferrer" style={linkStyle()} title="Open in Observium">{device.hostname}</a> : <span>{device.hostname}</span>}{meta && linkedPlatformBadges("observium", meta)}</div><div style={{ color: "var(--text3)", fontSize: 10 }}>{device.sysName || device.ip || ""}</div></td>
                         <td style={{ color: "var(--accent2)" }}>{device.snmp_version}/{device.snmp_port}</td>
                         <td><span className={`tag ${device.archived ? "tag-warn" : device.disabled ? "tag-warn" : "tag-ok"}`} style={{ fontSize: 9 }}>{device.archived ? "archived" : device.disabled ? "disabled" : (device.status ? "up" : "down")}</span></td>
-                        <td><div className="flex-gap"><button className="btn-secondary" style={{ padding: "2px 8px", fontSize: 10 }} onClick={() => openWithCorrelation("observium", device.device_id, device.hostname)}>{meta ? "Open Group" : "Open"}</button><button className="btn-secondary" style={{ padding: "2px 8px", fontSize: 10 }} onClick={() => toggleArchive("observium", { id: device.device_id, label: device.hostname }, device.archived)}>{device.archived ? "Restore" : "Archive"}</button></div></td>
+                        <td><div className="flex-gap"><button className="btn-secondary" style={{ padding: "2px 8px", fontSize: 10 }} onClick={() => openInventoryItem("observium", device.device_id, device.hostname)}>{meta ? "Open Group" : "Open"}</button><button className="btn-secondary" style={{ padding: "2px 8px", fontSize: 10 }} onClick={() => toggleArchive("observium", { id: device.device_id, label: device.hostname }, device.archived)}>{device.archived ? "Restore" : "Archive"}</button></div></td>
                       </tr>
                     )})}
                   </tbody>

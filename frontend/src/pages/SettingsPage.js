@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { api } from "../utils/api";
 import { useLogs } from "../hooks/useLogs";
 
-export function SettingsPage({ uiPrefs, onUiPrefsChange, themePresets, companyProfile }) {
+export function SettingsPage({ uiPrefs, onUiPrefsChange, themePresets }) {
   const { addLog } = useLogs();
   const [creds, setCreds] = useState({
     zabbix_url: "",
@@ -159,22 +159,6 @@ export function SettingsPage({ uiPrefs, onUiPrefsChange, themePresets, companyPr
           </div>
           <div className="notice notice-info" style={{ marginBottom: 0 }}>
             Inventory now highlights saved correlation groups and automatic matches by IP/name based on the selected visual mode.
-          </div>
-        </div>
-      </div>
-
-      <div className="section" style={{ marginBottom: 24 }}>
-        <div className="section-header"><span>Company Profile</span></div>
-        <div className="section-body">
-          <div className="notice notice-info" style={{ marginBottom: 12 }}>
-            Move company-specific branding and internal publishing rules to `backend/config/company.local.json`. Keep that file local and out of Git.
-          </div>
-          <div className="grid-2">
-            <div className="field-row"><label>Company</label><input value={companyProfile?.branding?.company_name || ""} readOnly /></div>
-            <div className="field-row"><label>Subtitle</label><input value={companyProfile?.branding?.app_subtitle || ""} readOnly /></div>
-          </div>
-          <div style={{ marginTop: 12, color: "var(--text3)", fontSize: 12 }}>
-            Sensitive paths: {(companyProfile?.publishing?.sensitive_paths || []).join(", ")}
           </div>
         </div>
       </div>

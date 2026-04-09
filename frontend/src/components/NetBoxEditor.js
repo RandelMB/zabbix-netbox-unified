@@ -774,7 +774,7 @@ export function NetBoxEditor({ deviceId, onDataReady }) {
                       </select>
                     </div>
                     <div className="notice notice-info" style={{ marginBottom: 8 }}>
-                      Choose the preferred source for each field. `platform` creates the missing NetBox platform automatically. `primary_ip4` creates or reuses the IP in NetBox and assigns it as the device primary IP. `description` only pulls the OS version string.
+                      Choose the preferred source for each field. `platform` uses `OS + version` and creates the missing NetBox platform automatically. `primary_ip4` creates or reuses the IP in NetBox and assigns it as the device primary IP.
                     </div>
                     {(Object.entries(syncPreview.fields || [])).map(([field, meta]) => (
                       <div key={field} className="section" style={{ padding: 12, marginBottom: 12 }}>
@@ -796,19 +796,11 @@ export function NetBoxEditor({ deviceId, onDataReady }) {
                           </div>
                           <div className="field-row">
                             <label>Zabbix</label>
-                            {field === "description" ? (
-                              <textarea value={meta.candidates?.zabbix || ""} readOnly style={{ height: 82, resize: "vertical" }} />
-                            ) : (
-                              <input value={meta.candidates?.zabbix || ""} readOnly />
-                            )}
+                            <input value={meta.candidates?.zabbix || ""} readOnly />
                           </div>
                           <div className="field-row">
                             <label>Observium</label>
-                            {field === "description" ? (
-                              <textarea value={meta.candidates?.observium || ""} readOnly style={{ height: 82, resize: "vertical" }} />
-                            ) : (
-                              <input value={meta.candidates?.observium || ""} readOnly />
-                            )}
+                            <input value={meta.candidates?.observium || ""} readOnly />
                           </div>
                         </div>
                       </div>

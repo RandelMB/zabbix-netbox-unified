@@ -23,27 +23,29 @@ export function WorkspacePage({ pendingTab, onPendingConsumed }) {
   useEffect(() => {
     if (pendingTab) {
       if (Array.isArray(pendingTab?.devices)) {
-        addTabs(pendingTab.devices);
+        addTabs(pendingTab.devices, pendingTab?.correlation || null);
       } else {
-        addTabs([pendingTab]);
+        addTabs([pendingTab], pendingTab?.correlation || null);
       }
       onPendingConsumed && onPendingConsumed();
     }
   }, [pendingTab, onPendingConsumed]);
 
-  function addTabs(devices) {
+  function addTabs(devices, correlation = null) {
     const nextActive = {};
+    const linkGroup = correlation?.groupId || correlation?.id || null;
     setTabs(prev => {
       const next = [...prev];
       for (const device of devices) {
         if (!device?.type || device?.id === undefined || device?.id === null) continue;
         const exists = next.find(item => item.type === device.type && item.deviceId === device.id);
         if (exists) {
+          if (linkGroup && exists.linkGroup !== linkGroup) exists.linkGroup = linkGroup;
           nextActive[device.type] = exists.id;
           continue;
         }
         const id = ++_tabCounter;
-        next.push({ id, type: device.type, label: device.label, deviceId: device.id });
+        next.push({ id, type: device.type, label: device.label, deviceId: device.id, linkGroup });
         nextActive[device.type] = id;
       }
       return next;
@@ -63,16 +65,35 @@ export function WorkspacePage({ pendingTab, onPendingConsumed }) {
   function closeTab(id) {
     setTabs(prev => {
       const current = prev.find(item => item.id === id);
-      const next = prev.filter(item => item.id !== id);
-      if (current && activeByType[current.type] === id) {
-        const replacement = next.find(item => item.type === current.type);
-        setActiveByType(state => ({ ...state, [current.type]: replacement ? replacement.id : null }));
+      const idsToRemove = new Set(
+        current?.linkGroup
+          ? prev.filter(item => item.linkGroup === current.linkGroup).map(item => item.id)
+          : [id]
+      );
+      const next = prev.filter(item => !idsToRemove.has(item.id));
+      if (current) {
+        setActiveByType(state => {
+          const updated = { ...state };
+          for (const type of ["zabbix", "netbox", "observium"]) {
+            if (idsToRemove.has(updated[type])) {
+              const replacement = next.find(item => item.type === type);
+              updated[type] = replacement ? replacement.id : null;
+            }
+          }
+          return updated;
+        });
       }
       return next;
     });
     setDeviceData(prev => {
       const clone = { ...prev };
-      delete clone[id];
+      const currentTab = tabs.find(item => item.id === id);
+      const idsToRemove = currentTab?.linkGroup
+        ? tabs.filter(item => item.linkGroup === currentTab.linkGroup).map(item => item.id)
+        : [id];
+      idsToRemove.forEach(tabId => {
+        delete clone[tabId];
+      });
       return clone;
     });
   }
