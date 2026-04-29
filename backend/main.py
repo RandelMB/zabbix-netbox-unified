@@ -7,6 +7,8 @@ import sqlite3
 import re
 import urllib.parse
 import base64
+import subprocess
+import asyncio
 from pathlib import Path
 from typing import Any, Optional
 from xml.sax.saxutils import escape as xml_escape
@@ -52,6 +54,8 @@ cfg = Config()
 runtime_creds: dict[str, Any] = {}
 _zabbix_auth_token: Optional[str] = None
 _observium_device_columns_cache: Optional[set[str]] = None
+_observium_table_columns_cache: dict[str, set[str]] = {}
+_interface_sync_locks: dict[int, asyncio.Lock] = {}
 
 
 class Credentials(BaseModel):
@@ -131,6 +135,59 @@ class NetBoxPrimaryIpFixPayload(BaseModel):
 class NetBoxSyncProfilePayload(BaseModel):
     enabled: bool = False
     field_sources: dict[str, str] = Field(default_factory=dict)
+
+
+class NetBoxInterfaceSyncRunPayload(BaseModel):
+    rename_interfaces: bool = True
+    sync_descriptions: bool = True
+    sync_mac_addresses: bool = True
+    sync_enabled_state: bool = True
+    sync_type: bool = True
+    sync_mtu: bool = True
+    sync_vlan_tags: bool = True
+    sync_lag_members: bool = True
+    sync_connections: bool = True
+    create_missing_interfaces: bool = False
+    replace_existing_interfaces: bool = True
+    reassign_primary_ip: bool = True
+    management_interface_name: Optional[str] = None
+
+
+class NetBoxLldpApplyPayload(BaseModel):
+    proposal_ids: list[str] = Field(default_factory=list)
+    role_id: Optional[int] = None
+    site_id: Optional[int] = None
+
+
+class NetBoxSnmpProbePayload(BaseModel):
+    ip: str
+    snmp_version: str = "v2c"
+    snmp_community: Optional[str] = None
+    snmp_port: int = 161
+    snmp_transport: str = "udp"
+    site_id: Optional[int] = None
+    role_id: Optional[int] = None
+
+
+class NetBoxSnmpImportPayload(NetBoxSnmpProbePayload):
+    name: Optional[str] = None
+    device_type_id: Optional[int] = None
+    platform_id: Optional[int] = None
+    serial: Optional[str] = None
+    description: Optional[str] = None
+
+
+class DiscoveryLldpPreviewPayload(BaseModel):
+    source: str
+    source_id: str
+
+
+class DiscoveryLldpApplyPayload(BaseModel):
+    source: str
+    source_id: str
+    proposal_ids: list[str] = Field(default_factory=list)
+    site_id: Optional[int] = None
+    role_id: Optional[int] = None
 
 
 def app_db() -> sqlite3.Connection:
@@ -299,6 +356,13 @@ def observium_exec(args: list[str]) -> dict[str, Any]:
     if result.exit_code != 0:
         raise HTTPException(400, f"Observium command failed: {output}")
     return {"command": args, "output": output}
+
+
+def observium_exec_result(args: list[str]) -> dict[str, Any]:
+    logger.info("Observium exec result: %s", " ".join(shlex.quote(arg) for arg in args))
+    result = observium_container().exec_run(args)
+    output = result.output.decode("utf-8", errors="replace")
+    return {"command": args, "output": output, "exit_code": int(result.exit_code)}
 
 
 def is_ip_address(value: str) -> bool:
@@ -882,6 +946,24 @@ async def ensure_netbox_platform(name: str) -> dict[str, Any]:
     return {"created": True, "platform": created.get("result") or created.get("response") or {}}
 
 
+async def netbox_find_manufacturer(name: str) -> Optional[dict[str, Any]]:
+    target = normalize_key(name)
+    if not target:
+        return None
+    for item in await netbox_paginated("/dcim/manufacturers/", {"limit": 500}):
+        if normalize_key(item.get("name")) == target or normalize_key(item.get("display")) == target:
+            return item
+    return None
+
+
+async def ensure_netbox_manufacturer(name: str) -> dict[str, Any]:
+    existing = await netbox_find_manufacturer(name)
+    if existing:
+        return {"created": False, "manufacturer": existing}
+    created = await netbox_request("POST", "/dcim/manufacturers/", {"name": name, "slug": slugify_text(name)[:100]})
+    return {"created": True, "manufacturer": created.get("result") or created.get("response") or {}}
+
+
 async def netbox_find_location(name: str, site_id: Optional[int]) -> Optional[dict[str, Any]]:
     params: dict[str, Any] = {}
     if site_id:
@@ -905,6 +987,1155 @@ async def ensure_netbox_location(name: str, site_id: Optional[int]) -> dict[str,
         {"name": name, "slug": slugify_text(name)[:90], "site": int(site_id)},
     )
     return {"created": True, "location": created.get("result") or created.get("response") or {}}
+
+
+def observium_table_columns(table: str) -> set[str]:
+    cached = _observium_table_columns_cache.get(table)
+    if cached is not None:
+        return cached
+    try:
+        rows = observium_db_query(
+            """
+            SELECT COLUMN_NAME
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
+            """,
+            (cfg.OBSERVIUM_DB_NAME, table),
+        )
+    except Exception:
+        rows = []
+    columns = {compact_text(row.get("COLUMN_NAME")) for row in rows or [] if compact_text(row.get("COLUMN_NAME"))}
+    _observium_table_columns_cache[table] = columns
+    return columns
+
+
+def observium_table_exists(table: str) -> bool:
+    return bool(observium_table_columns(table))
+
+
+def as_int(value: Any) -> Optional[int]:
+    try:
+        if value in (None, ""):
+            return None
+        return int(str(value).strip())
+    except Exception:
+        return None
+
+
+def parse_mac_address(value: Any) -> str:
+    if isinstance(value, (bytes, bytearray)):
+        raw_bytes = bytes(value)
+        if len(raw_bytes) == 6:
+            return ":".join(f"{part:02X}" for part in raw_bytes)
+        try:
+            value = raw_bytes.decode("utf-8", "ignore")
+        except Exception:
+            value = raw_bytes.hex()
+    raw = compact_text(value).replace("-", ":").replace(".", "").upper()
+    if not raw:
+        return ""
+    if "." in compact_text(value):
+        chunks = [raw[i:i + 4] for i in range(0, len(raw), 4)]
+        raw = ":".join(chunk[:2] + ":" + chunk[2:] for chunk in chunks if len(chunk) == 4)
+    if ":" not in raw:
+        compact = "".join(char for char in raw if char.isalnum())
+        if len(compact) == 12:
+            raw = ":".join(compact[i:i + 2] for i in range(0, 12, 2))
+    parts = [part.zfill(2) for part in raw.split(":") if part]
+    if len(parts) != 6 or any(len(part) != 2 for part in parts):
+        return ""
+    return ":".join(parts)
+
+
+def humanize_speed(speed_bps: Optional[int]) -> str:
+    if not speed_bps or speed_bps <= 0:
+        return ""
+    units = ["bps", "Kbps", "Mbps", "Gbps", "Tbps"]
+    value = float(speed_bps)
+    unit = units[0]
+    for candidate in units:
+        unit = candidate
+        if value < 1000 or candidate == units[-1]:
+            break
+        value /= 1000.0
+    return f"{value:.0f} {unit}" if value >= 100 else f"{value:.1f} {unit}"
+
+
+def port_speed_bps(row: dict[str, Any]) -> Optional[int]:
+    speed = as_int(first_non_empty(row, "ifSpeed", "if_speed"))
+    if speed:
+        return speed
+    high_speed = as_int(first_non_empty(row, "ifHighSpeed", "if_high_speed"))
+    if high_speed:
+        return high_speed * 1_000_000
+    return None
+
+
+def normalize_port_name_text(value: Any) -> str:
+    text = compact_text(value)
+    if not text:
+        return ""
+    lowered = text.lower()
+    patterns = (
+        (r"^port\s+(\d+)$", lambda m: f"port{m.group(1)}"),
+        (r"^gigabitethernet\s*([0-9/]+)$", lambda m: f"gi{m.group(1)}"),
+        (r"^gi(?:gabitethernet)?\s*([0-9/]+)$", lambda m: f"gi{m.group(1)}"),
+        (r"^tengigabitethernet\s*([0-9/]+)$", lambda m: f"te{m.group(1)}"),
+        (r"^te\s*([0-9/]+)$", lambda m: f"te{m.group(1)}"),
+        (r"^ethernet\s*([0-9/]+)$", lambda m: f"ethernet {m.group(1)}"),
+        (r"^eth\s*([0-9/]+)$", lambda m: f"eth {m.group(1)}"),
+        (r"^fastethernet\s*([0-9/]+)$", lambda m: f"fa{m.group(1)}"),
+        (r"^fa\s*([0-9/]+)$", lambda m: f"fa{m.group(1)}"),
+        (r"^port-channel\s*([0-9/]+)$", lambda m: f"port-channel{m.group(1)}"),
+        (r"^po\s*([0-9/]+)$", lambda m: f"po{m.group(1)}"),
+        (r"^ae\s*([0-9/]+)$", lambda m: f"ae{m.group(1)}"),
+    )
+    for pattern, formatter in patterns:
+        match = re.match(pattern, lowered)
+        if match:
+            return formatter(match)
+    if re.match(r"^(port\d+|gi[0-9/]+|te[0-9/]+|fa[0-9/]+|po[0-9/]+|ae[0-9/]+|eth ?[0-9/]+|ethernet ?[0-9/]+)$", lowered):
+        return lowered
+    return text
+
+
+def looks_like_short_port_name(value: Any) -> bool:
+    text = normalize_port_name_text(value)
+    if not text:
+        return False
+    lowered = text.lower()
+    return bool(
+        re.match(r"^(port\d+|gi[0-9/]+|te[0-9/]+|fa[0-9/]+|po[0-9/]+|ae[0-9/]+|eth ?[0-9/]+|ethernet ?[0-9/]+|vlan ?\d+|lo\d+)$", lowered)
+        or "mlag" in lowered
+        or "lag" in lowered
+        or "port-channel" in lowered
+        or lowered.startswith("_")
+    )
+
+
+def first_non_empty_normalized(*values: Any) -> str:
+    for value in values:
+        text = normalize_port_name_text(value)
+        if text:
+            return text
+    return ""
+
+
+def pick_observium_port_name(row: dict[str, Any]) -> str:
+    candidates = [
+        row.get("port_label_short"),
+        row.get("ifName"),
+        row.get("port_label"),
+        row.get("port_label_base"),
+        row.get("label"),
+        row.get("ifDescr"),
+        row.get("port_descr"),
+    ]
+    for candidate in candidates:
+        if looks_like_short_port_name(candidate):
+            return compact_text(candidate)
+    return compact_text(first_non_empty_normalized(*candidates)) or compact_text(row.get("ifIndex")) or "unnamed"
+
+
+def pick_observium_port_description(row: dict[str, Any], port_name: str) -> str:
+    vendor = compact_text(first_non_empty(row, "vendor", "device_vendor")).lower()
+    port_number = compact_text(first_non_empty(row, "ifIndex", "if_index", "port_id"))
+    generic_patterns = [
+        rf"port\s*{re.escape(port_number)}$" if port_number else "",
+        r"module\s*-\s*port\s*\d+$",
+        r"^vlan\s*#?\d+$",
+    ]
+    for candidate in (
+        row.get("ifAlias"),
+        row.get("port_descr"),
+    ):
+        text = compact_text(candidate)
+        lowered = text.lower()
+        if not text or text == compact_text(port_name):
+            continue
+        if vendor and vendor in lowered and re.search(r"port\s+\d+$", lowered):
+            continue
+        if any(pattern and re.search(pattern, lowered) for pattern in generic_patterns):
+            continue
+        if looks_like_short_port_name(text):
+            continue
+        if text:
+            return text
+    return ""
+
+
+def is_lag_name(value: Any) -> bool:
+    text = compact_text(value).lower()
+    return any(token in text for token in ("mlag", "port-channel", "lag", "ae", "bond")) or text.startswith("_")
+
+
+def lag_name_candidate(row: dict[str, Any]) -> str:
+    for candidate in (row.get("ifName"), row.get("ifDescr"), row.get("port_label"), row.get("ifAlias")):
+        text = compact_text(candidate)
+        if text and is_lag_name(text):
+            return text
+    return ""
+
+
+def find_table_column(columns: set[str], *candidates: str) -> str:
+    for candidate in candidates:
+        if candidate in columns:
+            return candidate
+    return ""
+
+
+def pick_observium_vlan_id(row: dict[str, Any]) -> Optional[str]:
+    for key in ("vlan_vlan", "vlan", "vlan_id", "ifVlan", "if_vlan", "access_vlan"):
+        value = compact_text(row.get(key))
+        if value and value not in {"0", "None"}:
+            return value
+    return None
+
+
+def netbox_interface_type_candidate(row: dict[str, Any]) -> str:
+    raw_type = compact_text(first_non_empty(row, "ifType", "if_type")).lower()
+    speed = port_speed_bps(row) or 0
+    mapping = {
+        "softwareloopback": "virtual",
+        "propvirtual": "virtual",
+        "l2vlan": "virtual",
+        "bridge": "bridge",
+        "ieee8023adlag": "lag",
+    }
+    if raw_type in mapping:
+        return mapping[raw_type]
+    if raw_type == "ethernetcsmacd":
+        if speed >= 100_000_000_000:
+            return "100gbase-x-qsfp28"
+        if speed >= 40_000_000_000:
+            return "40gbase-x-qsfpp"
+        if speed >= 25_000_000_000:
+            return "25gbase-x-sfp28"
+        if speed >= 10_000_000_000:
+            return "10gbase-x-sfpp"
+        if speed >= 5_000_000_000:
+            return "5gbase-t"
+        if speed >= 2_500_000_000:
+            return "2.5gbase-t"
+        if speed >= 1_000_000_000:
+            return "1000base-t"
+        if speed >= 100_000_000:
+            return "100base-tx"
+        if speed >= 10_000_000:
+            return "10base-t"
+        return "other"
+    return ""
+
+
+def summarize_oper_state(row: dict[str, Any]) -> dict[str, Any]:
+    oper = compact_text(first_non_empty(row, "ifOperStatus", "if_oper_status"))
+    admin = compact_text(first_non_empty(row, "ifAdminStatus", "if_admin_status"))
+    speed_bps = port_speed_bps(row)
+    return {
+        "oper_status": oper,
+        "admin_status": admin,
+        "speed_bps": speed_bps,
+        "speed_label": humanize_speed(speed_bps),
+        "type": compact_text(first_non_empty(row, "ifType", "if_type")),
+        "mtu": as_int(first_non_empty(row, "ifMtu", "if_mtu")),
+    }
+
+
+def normalize_observium_port(row: dict[str, Any]) -> dict[str, Any]:
+    data = dict(row)
+    port_name = pick_observium_port_name(data)
+    state = summarize_oper_state(data)
+    candidates = []
+    for candidate in (
+        data.get("port_label_short"),
+        data.get("ifDescr"),
+        data.get("ifName"),
+        data.get("port_label"),
+        data.get("port_label_base"),
+        data.get("label"),
+        data.get("port_descr"),
+    ):
+        text = compact_text(candidate)
+        if text and text not in candidates:
+            candidates.append(text)
+    return {
+        "port_id": as_int(data.get("port_id")) or 0,
+        "device_id": as_int(data.get("device_id")) or 0,
+        "ifIndex": as_int(data.get("ifIndex") or data.get("if_index")),
+        "name": port_name,
+        "name_candidates": candidates or [port_name],
+        "description": pick_observium_port_description(data, port_name),
+        "mac_address": parse_mac_address(first_non_empty(
+            data,
+            "ifPhysAddress",
+            "ifPhysAddress_hex",
+            "ifPhysAddress_text",
+            "if_phys_address",
+            "phys_address",
+            "mac_address",
+        )),
+        "type": netbox_interface_type_candidate(data),
+        "raw_type": state["type"],
+        "admin_status": state["admin_status"],
+        "oper_status": state["oper_status"],
+        "enabled_candidate": state["admin_status"].lower() not in {"down", "disabled", "admin down"} if state["admin_status"] else None,
+        "speed_bps": state["speed_bps"],
+        "speed_label": state["speed_label"],
+        "mtu": state["mtu"],
+        "vlans": [],
+        "lag_parent_port_id": None,
+        "lag_parent_name": "",
+        "lag_member_port_ids": [],
+        "lag_member_names": [],
+        "lag_role": "standalone",
+        "lag_name": lag_name_candidate(data),
+        "raw": data,
+    }
+
+
+def vlan_tag_slug(vlan_id: str) -> str:
+    return slugify_text(f"vlan-{vlan_id}")[:100]
+
+
+def is_vlan_tag_slug(slug: str) -> bool:
+    return compact_text(slug).lower().startswith("vlan-")
+
+
+async def ensure_netbox_tag(name: str, slug: str) -> dict[str, Any]:
+    existing = await netbox_paginated("/extras/tags/", {"slug": slug})
+    if existing:
+        return {"created": False, "tag": existing[0]}
+    created = await netbox_request(
+        "POST",
+        "/extras/tags/",
+        {"name": name, "slug": slug, "color": "607d8b"},
+    )
+    return {"created": True, "tag": created.get("result") or created.get("response") or {}}
+
+
+def merge_interface_vlan_tags(existing_tags: list[dict[str, Any]], vlan_tag_ids: list[int]) -> list[int]:
+    preserved = [
+        int(tag["id"])
+        for tag in existing_tags
+        if tag.get("id") is not None and not is_vlan_tag_slug(compact_text(tag.get("slug")))
+    ]
+    merged = preserved + [int(tag_id) for tag_id in vlan_tag_ids if tag_id is not None]
+    deduped: list[int] = []
+    for tag_id in merged:
+        if tag_id not in deduped:
+            deduped.append(tag_id)
+    return deduped
+
+
+def interface_match_keys(name: str) -> list[str]:
+    keys: list[str] = []
+    for candidate in (name, name.replace(" ", ""), name.replace("-", ""), name.replace("_", "")):
+        normalized = normalize_key(candidate)
+        if normalized and normalized not in keys:
+            keys.append(normalized)
+    return keys
+
+
+def netbox_interface_summary(interface: dict[str, Any]) -> dict[str, Any]:
+    primary_mac = interface.get("primary_mac_address") or {}
+    lag = interface.get("lag") or {}
+    return {
+        "id": int(interface["id"]),
+        "name": compact_text(interface.get("name")),
+        "type": compact_text((interface.get("type") or {}).get("value") or interface.get("type")),
+        "enabled": bool(interface.get("enabled", True)),
+        "description": compact_text(interface.get("description")),
+        "mac_address": parse_mac_address(interface.get("mac_address") or primary_mac.get("mac_address")),
+        "mtu": as_int(interface.get("mtu")),
+        "tags": interface.get("tags") or [],
+        "lag_id": as_int(lag.get("id")),
+        "lag_name": compact_text(lag.get("name")),
+    }
+
+
+def build_interface_sync_actions(netbox_interface: dict[str, Any], observium_port: dict[str, Any], lag_netbox_name: str = "") -> list[dict[str, Any]]:
+    actions: list[dict[str, Any]] = []
+    if compact_text(netbox_interface.get("name")) != compact_text(observium_port.get("name")):
+        actions.append({"field": "name", "current": netbox_interface.get("name"), "proposed": observium_port.get("name")})
+
+    proposed_description = compact_text(observium_port.get("description"))
+    if proposed_description and proposed_description != compact_text(netbox_interface.get("description")):
+        actions.append({"field": "description", "current": netbox_interface.get("description"), "proposed": proposed_description})
+
+    proposed_mac = parse_mac_address(observium_port.get("mac_address"))
+    if proposed_mac and not observium_port.get("mac_sync_skipped") and proposed_mac != parse_mac_address(netbox_interface.get("mac_address")):
+        actions.append({"field": "mac_address", "current": netbox_interface.get("mac_address"), "proposed": proposed_mac})
+
+    if observium_port.get("enabled_candidate") is not None and bool(netbox_interface.get("enabled", True)) != bool(observium_port.get("enabled_candidate")):
+        actions.append({"field": "enabled", "current": bool(netbox_interface.get("enabled", True)), "proposed": bool(observium_port.get("enabled_candidate"))})
+
+    proposed_type = compact_text(observium_port.get("type"))
+    if proposed_type and proposed_type != compact_text(netbox_interface.get("type")):
+        actions.append({"field": "type", "current": netbox_interface.get("type"), "proposed": proposed_type})
+
+    proposed_mtu = as_int(observium_port.get("mtu"))
+    if proposed_mtu and proposed_mtu != as_int(netbox_interface.get("mtu")):
+        actions.append({"field": "mtu", "current": netbox_interface.get("mtu"), "proposed": proposed_mtu})
+
+    proposed_vlans = vlan_representation_tokens(observium_port.get("vlans") or [])
+    if proposed_vlans:
+        current_vlans = interface_vlan_representation(netbox_interface.get("tags") or [])
+        if proposed_vlans != current_vlans:
+            actions.append({"field": "vlan_tags", "current": current_vlans, "proposed": proposed_vlans})
+
+    if lag_netbox_name and compact_text(netbox_interface.get("lag_name")) != compact_text(lag_netbox_name):
+        actions.append({"field": "lag", "current": netbox_interface.get("lag_name"), "proposed": lag_netbox_name})
+
+    return actions
+
+
+def observium_port_stack_rows(port_ids: list[int]) -> list[dict[str, Any]]:
+    if not port_ids or not observium_table_exists("ports_stack"):
+        return []
+    columns = observium_table_columns("ports_stack")
+    high_col = find_table_column(columns, "port_id_high", "high_port_id", "higher_port_id")
+    low_col = find_table_column(columns, "port_id_low", "low_port_id", "lower_port_id")
+    if not high_col or not low_col:
+        return []
+    placeholders = ", ".join(["%s"] * len(port_ids))
+    try:
+        return observium_db_query(
+            f"SELECT * FROM ports_stack WHERE {high_col} IN ({placeholders}) OR {low_col} IN ({placeholders})",
+            tuple(port_ids + port_ids),
+        )
+    except Exception:
+        return []
+
+
+def apply_observium_lag_relationships(ports: list[dict[str, Any]]) -> None:
+    port_map = {int(port["port_id"]): port for port in ports if port.get("port_id")}
+    rows = observium_port_stack_rows(list(port_map.keys()))
+    if rows:
+        columns = observium_table_columns("ports_stack")
+        high_col = find_table_column(columns, "port_id_high", "high_port_id", "higher_port_id")
+        low_col = find_table_column(columns, "port_id_low", "low_port_id", "lower_port_id")
+        for row in rows:
+            high_id = as_int(row.get(high_col))
+            low_id = as_int(row.get(low_col))
+            if not high_id or not low_id or high_id not in port_map or low_id not in port_map:
+                continue
+            parent = port_map[high_id]
+            member = port_map[low_id]
+            if low_id not in parent["lag_member_port_ids"]:
+                parent["lag_member_port_ids"].append(low_id)
+            member["lag_parent_port_id"] = high_id
+
+    for port in ports:
+        if port.get("type") == "lag" or is_lag_name(port.get("name")) or is_lag_name(port.get("lag_name")):
+            if port["lag_role"] == "standalone":
+                port["lag_role"] = "parent"
+
+    for port in ports:
+        parent_id = as_int(port.get("lag_parent_port_id"))
+        if parent_id and parent_id in port_map:
+            parent = port_map[parent_id]
+            port["lag_parent_name"] = parent.get("name") or parent.get("lag_name") or ""
+            port["lag_role"] = "member"
+            if int(port["port_id"]) not in parent["lag_member_port_ids"]:
+                parent["lag_member_port_ids"].append(int(port["port_id"]))
+
+    for port in ports:
+        member_names = []
+        for member_id in port.get("lag_member_port_ids") or []:
+            member = port_map.get(member_id)
+            if member:
+                member_names.append(member.get("name") or "")
+        port["lag_member_names"] = [name for name in member_names if name]
+
+
+def match_observium_ports_to_netbox(
+    netbox_interfaces: list[dict[str, Any]],
+    observium_ports: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    by_name: dict[str, list[dict[str, Any]]] = {}
+    by_mac: dict[str, list[dict[str, Any]]] = {}
+    for interface in netbox_interfaces:
+        for key in interface_match_keys(compact_text(interface.get("name"))):
+            by_name.setdefault(key, []).append(interface)
+        mac = parse_mac_address(interface.get("mac_address"))
+        if mac:
+            by_mac.setdefault(mac, []).append(interface)
+
+    used_ids: set[int] = set()
+    matches: list[dict[str, Any]] = []
+
+    for port in observium_ports:
+        matched = None
+        match_method = ""
+        for candidate in port.get("name_candidates") or [port.get("name")]:
+            candidates = [
+                item
+                for key in interface_match_keys(candidate)
+                for item in by_name.get(key, [])
+                if int(item["id"]) not in used_ids
+            ]
+            unique = {int(item["id"]): item for item in candidates}
+            if len(unique) == 1:
+                matched = next(iter(unique.values()))
+                match_method = "name"
+                break
+        if matched is None and port.get("mac_address"):
+            candidates = [item for item in by_mac.get(parse_mac_address(port["mac_address"]), []) if int(item["id"]) not in used_ids]
+            if len(candidates) == 1:
+                matched = candidates[0]
+                match_method = "mac"
+
+        if matched is None:
+            create_actions = [
+                {"field": "create_interface", "current": "", "proposed": port.get("name")},
+            ]
+            matches.append(
+                {
+                    "status": "unmatched_observium",
+                    "match_method": None,
+                    "netbox": None,
+                    "observium": port,
+                    "actions": create_actions,
+                }
+            )
+            continue
+
+        used_ids.add(int(matched["id"]))
+        matches.append(
+            {
+                "status": "matched",
+                "match_method": match_method,
+                "netbox": matched,
+                "observium": port,
+                "actions": build_interface_sync_actions(matched, port),
+            }
+        )
+
+    for interface in netbox_interfaces:
+        if int(interface["id"]) in used_ids:
+            continue
+        matches.append(
+            {
+                "status": "unmatched_netbox",
+                "match_method": None,
+                "netbox": interface,
+                "observium": None,
+                "actions": [],
+            }
+        )
+
+    return matches, [item for item in matches if item["status"] == "matched"]
+
+
+def netbox_site_id(device: dict[str, Any]) -> Optional[int]:
+    site = device.get("site") or {}
+    return as_int(site.get("id") if isinstance(site, dict) else site)
+
+
+def observium_port_rows(device_id: int) -> list[dict[str, Any]]:
+    if not observium_table_exists("ports"):
+        return []
+    rows = observium_db_query(
+        """
+        SELECT *
+        FROM ports
+        WHERE device_id = %s
+        ORDER BY COALESCE(ifIndex, 0), COALESCE(port_id, 0)
+        """,
+        (device_id,),
+    )
+    ports = [normalize_observium_port(row) for row in rows or [] if not as_int(dict(row).get("deleted"))]
+    if not ports or not observium_table_exists("ports_vlans"):
+        return ports
+
+    port_ids = [port["port_id"] for port in ports if port.get("port_id")]
+    if not port_ids:
+        return ports
+    placeholders = ", ".join(["%s"] * len(port_ids))
+    try:
+        vlan_rows = observium_db_query(f"SELECT * FROM ports_vlans WHERE port_id IN ({placeholders})", tuple(port_ids))
+    except Exception:
+        vlan_rows = []
+    vlan_map: dict[int, list[str]] = {}
+    for row in vlan_rows or []:
+        port_id = as_int(dict(row).get("port_id"))
+        vlan_id = pick_observium_vlan_id(dict(row))
+        if port_id and vlan_id:
+            vlan_map.setdefault(port_id, [])
+            if vlan_id not in vlan_map[port_id]:
+                vlan_map[port_id].append(vlan_id)
+    for port in ports:
+        direct_vlan = pick_observium_vlan_id(port.get("raw") or {})
+        vlans = list(vlan_map.get(port["port_id"], []))
+        if direct_vlan and direct_vlan not in vlans:
+            vlans.append(direct_vlan)
+        port["vlans"] = vlans
+    apply_observium_lag_relationships(ports)
+    mac_counts: dict[str, int] = {}
+    for port in ports:
+        mac = parse_mac_address(port.get("mac_address"))
+        if mac:
+            mac_counts[mac] = mac_counts.get(mac, 0) + 1
+    for port in ports:
+        mac = parse_mac_address(port.get("mac_address"))
+        if mac and mac_counts.get(mac, 0) > 1:
+            port["mac_sync_skipped"] = "duplicate_device_mac"
+    return ports
+
+
+def summarize_vlan_ids(vlan_values: list[Any]) -> list[str]:
+    values = []
+    for item in vlan_values or []:
+        value = compact_text(item)
+        if value:
+            values.append(value)
+    if not values:
+        return []
+    numbers: list[int] = []
+    non_numeric: list[str] = []
+    for value in values:
+        try:
+            numbers.append(int(value))
+        except Exception:
+            if value not in non_numeric:
+                non_numeric.append(value)
+    ranges: list[str] = []
+    if numbers:
+        ordered = sorted(set(numbers))
+        start = ordered[0]
+        end = ordered[0]
+        for number in ordered[1:]:
+            if number == end + 1:
+                end = number
+                continue
+            ranges.append(f"{start}-{end}" if start != end else str(start))
+            start = number
+            end = number
+        ranges.append(f"{start}-{end}" if start != end else str(start))
+    return ranges + non_numeric
+
+
+def vlan_token_sort_key(token: Any) -> tuple[int, int, str]:
+    value = compact_text(token)
+    if not value:
+        return (2, 0, "")
+    if re.fullmatch(r"\d+", value):
+        return (0, int(value), value)
+    match = re.fullmatch(r"(\d+)-(\d+)", value)
+    if match:
+        return (1, int(match.group(1)), value)
+    return (2, 0, value.lower())
+
+
+def vlan_representation_tokens(vlan_values: list[Any]) -> list[str]:
+    normalized = [compact_text(item) for item in vlan_values or [] if compact_text(item)]
+    if not normalized:
+        return []
+
+    numeric_values: list[int] = []
+    non_numeric: list[str] = []
+    for item in normalized:
+        try:
+            numeric_values.append(int(item))
+        except Exception:
+            if item not in non_numeric:
+                non_numeric.append(item)
+
+    tokens: list[str] = []
+    ordered = sorted(set(numeric_values))
+    if ordered:
+        range_size = ordered[-1] - ordered[0] + 1
+        density = (len(ordered) / range_size) if range_size > 0 else 0
+        if len(ordered) <= 15:
+            tokens.extend(str(item) for item in ordered)
+        elif len(ordered) > 50 and density >= 0.7:
+            tokens.append(f"{ordered[0]}-{ordered[-1]}")
+        else:
+            tokens.extend(summarize_vlan_ids([str(item) for item in ordered]))
+
+    tokens.extend(non_numeric)
+    deduped: list[str] = []
+    for token in tokens:
+        if token not in deduped:
+            deduped.append(token)
+    return deduped
+
+
+def vlan_tag_name_and_slug(token: str) -> tuple[str, str]:
+    normalized = compact_text(token)
+    return (f"VLAN {normalized}", slugify_text(f"vlan-{normalized}")[:100])
+
+
+def interface_vlan_representation(tags: list[dict[str, Any]]) -> list[str]:
+    tokens: list[str] = []
+    for tag in tags or []:
+        slug = compact_text(tag.get("slug")).lower()
+        if not is_vlan_tag_slug(slug):
+            continue
+        token = compact_text(slug[5:]).replace("--", "-")
+        if token and token not in tokens:
+            tokens.append(token)
+    return sorted(tokens, key=vlan_token_sort_key)
+
+
+async def ensure_vlan_tags(vlan_values: list[Any]) -> list[int]:
+    ensured_tag_ids: list[int] = []
+    for token in vlan_representation_tokens(vlan_values):
+        name, slug = vlan_tag_name_and_slug(token)
+        ensured = await ensure_netbox_tag(name, slug)
+        tag = ensured.get("tag") or {}
+        if tag.get("id") is not None:
+            ensured_tag_ids.append(int(tag["id"]))
+    return ensured_tag_ids
+
+
+async def netbox_interface_connected_peer(interface_id: int) -> Optional[dict[str, Any]]:
+    detail_result = await netbox_request("GET", f"/dcim/interfaces/{interface_id}/")
+    detail = detail_result.get("result") or detail_result.get("response") or {}
+    peers = detail.get("connected_endpoints") or detail.get("link_peers") or []
+    if not peers:
+        peer = detail.get("connected_endpoint")
+        if peer:
+            peers = [peer]
+    for peer in peers or []:
+        if compact_text(peer.get("url")) or peer.get("id") is not None:
+            return {
+                "id": as_int(peer.get("id")),
+                "name": compact_text(peer.get("name") or peer.get("display")),
+                "device_name": compact_text(((peer.get("device") or {}).get("name")) if isinstance(peer.get("device"), dict) else ""),
+                "cable": detail.get("cable"),
+            }
+    return None
+
+
+async def find_netbox_interface_by_observium_port(device_id: int, observium_port: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    if not device_id or not observium_port:
+        return None
+    interfaces = [netbox_interface_summary(item) for item in await netbox_paginated("/dcim/interfaces/", {"device_id": device_id, "limit": 500})]
+    by_name: dict[str, list[dict[str, Any]]] = {}
+    by_mac: dict[str, list[dict[str, Any]]] = {}
+    for interface in interfaces:
+        for key in interface_match_keys(interface.get("name") or ""):
+            by_name.setdefault(key, []).append(interface)
+        mac = parse_mac_address(interface.get("mac_address"))
+        if mac:
+            by_mac.setdefault(mac, []).append(interface)
+    for candidate in observium_port.get("name_candidates") or [observium_port.get("name")]:
+        matches = []
+        for key in interface_match_keys(candidate):
+            matches.extend(by_name.get(key, []))
+        unique = {int(item["id"]): item for item in matches}
+        if len(unique) == 1:
+            return next(iter(unique.values()))
+    mac = parse_mac_address(observium_port.get("mac_address"))
+    if mac:
+        matches = by_mac.get(mac, [])
+        if len(matches) == 1:
+            return matches[0]
+    return None
+
+
+async def resolve_interface_connection_candidate(
+    *,
+    local_interface: Optional[dict[str, Any]],
+    local_observium_port: Optional[dict[str, Any]],
+    link_rows: dict[int, list[dict[str, Any]]],
+) -> Optional[dict[str, Any]]:
+    if not local_observium_port:
+        return None
+    port_id = as_int(local_observium_port.get("port_id"))
+    if not port_id:
+        return None
+    rows = link_rows.get(port_id) or []
+    if not rows:
+        return None
+    row = rows[0]
+    remote_device_id = as_int(first_non_empty(row, "remote_device_id", "peer_device_id", "device_id_remote"))
+    remote_port_id = as_int(first_non_empty(row, "remote_port_id", "peer_port_id", "port_id_remote"))
+    remote_device = observium_device_row(remote_device_id) if remote_device_id else None
+    remote_port = None
+    if remote_device_id:
+        remote_port_rows = observium_port_rows(remote_device_id)
+        remote_port = next((item for item in remote_port_rows if int(item.get("port_id") or 0) == remote_port_id), None)
+    remote_mac = observium_link_neighbor_mac(row) or parse_mac_address((remote_port or {}).get("mac_address"))
+    remote_ip = host_part((remote_device or {}).get("ip") or "") or (observium_ip_from_mac(remote_mac) if remote_mac else "")
+    remote_name = (
+        compact_text((remote_device or {}).get("sysName"))
+        or compact_text((remote_device or {}).get("hostname"))
+        or observium_link_neighbor_name(row)
+        or compact_text((remote_port or {}).get("description"))
+    )
+    remote_netbox_device = await netbox_find_device_by_identity(remote_name, remote_ip, remote_mac)
+    remote_netbox_interface = None
+    if remote_netbox_device and remote_port:
+        remote_netbox_interface = await find_netbox_interface_by_observium_port(int(remote_netbox_device["id"]), remote_port)
+    current_peer = await netbox_interface_connected_peer(int(local_interface["id"])) if local_interface and local_interface.get("id") is not None else None
+    return {
+        "protocol": compact_text(first_non_empty(row, "protocol", "link_type")) or "LLDP/CDP",
+        "remote_device": remote_device,
+        "remote_port": remote_port,
+        "remote_ip": remote_ip,
+        "remote_mac": remote_mac,
+        "remote_name": remote_name,
+        "remote_netbox_device": remote_netbox_device,
+        "remote_netbox_interface": remote_netbox_interface,
+        "current_peer": current_peer,
+    }
+
+
+async def ensure_netbox_interface_cable(interface_a_id: int, interface_b_id: int) -> dict[str, Any]:
+    if interface_a_id == interface_b_id:
+        raise HTTPException(400, "Cannot cable an interface to itself")
+    peer_a = await netbox_interface_connected_peer(interface_a_id)
+    peer_b = await netbox_interface_connected_peer(interface_b_id)
+    if peer_a and as_int(peer_a.get("id")) == int(interface_b_id) and peer_a.get("cable"):
+        return {"created": False, "cable": peer_a["cable"]}
+    if peer_a and as_int(peer_a.get("id")) not in {None, int(interface_b_id)}:
+        raise HTTPException(409, f"Interface {interface_a_id} is already connected to another endpoint")
+    if peer_b and as_int(peer_b.get("id")) not in {None, int(interface_a_id)}:
+        raise HTTPException(409, f"Interface {interface_b_id} is already connected to another endpoint")
+    created = await netbox_request(
+        "POST",
+        "/dcim/cables/",
+        {
+            "a_terminations": [{"object_type": "dcim.interface", "object_id": int(interface_a_id)}],
+            "b_terminations": [{"object_type": "dcim.interface", "object_id": int(interface_b_id)}],
+            "status": "connected",
+        },
+    )
+    return {"created": True, "cable": created.get("result") or created.get("response") or {}}
+
+
+async def build_netbox_interface_sync_preview(device_id: int) -> dict[str, Any]:
+    device_result = await netbox_request("GET", f"/dcim/devices/{device_id}/")
+    device = device_result.get("result") or {}
+    sources = await correlated_sources_for_netbox_device(device_id)
+    observium_device = sources["observium"]
+    if not observium_device:
+        raise HTTPException(404, "No Observium device is linked to this NetBox device")
+
+    netbox_interfaces = [netbox_interface_summary(item) for item in await netbox_paginated("/dcim/interfaces/", {"device_id": device_id, "limit": 500})]
+    observium_ports = observium_port_rows(int(observium_device["device_id"]))
+    matches, matched = match_observium_ports_to_netbox(netbox_interfaces, observium_ports)
+    link_rows = observium_link_rows(int(observium_device["device_id"]))
+    link_rows_by_port_id: dict[int, list[dict[str, Any]]] = {}
+    for row in link_rows:
+        local_port_id = as_int(first_non_empty(row, "local_port_id", "port_id", "port_id_local")) or 0
+        if local_port_id:
+            link_rows_by_port_id.setdefault(local_port_id, []).append(row)
+    observium_by_port_id = {int(item.get("port_id")): item for item in observium_ports if item.get("port_id")}
+    match_by_port_id = {
+        int(item["observium"]["port_id"]): item
+        for item in matches
+        if item.get("observium") and item["status"] == "matched"
+    }
+    for item in matches:
+        observium_port = item.get("observium") or {}
+        if not observium_port:
+            continue
+        lag_parent_name = ""
+        parent_id = as_int(observium_port.get("lag_parent_port_id"))
+        if parent_id and parent_id in match_by_port_id:
+            lag_parent_name = compact_text((match_by_port_id[parent_id].get("netbox") or {}).get("name"))
+        elif parent_id and parent_id in observium_by_port_id:
+            lag_parent_name = compact_text(observium_by_port_id[parent_id].get("name"))
+        item["lag_parent_name"] = lag_parent_name
+        item["lag_member_names"] = observium_port.get("lag_member_names") or []
+        if item["status"] == "matched":
+            item["actions"] = build_interface_sync_actions(item["netbox"] or {}, observium_port, lag_parent_name)
+        elif item["status"] == "unmatched_observium":
+            proposed_type = observium_port.get("type") or "other"
+            item["create_payload"] = {
+                "device": int(device_id),
+                "name": observium_port.get("name") or f"port-{observium_port.get('port_id')}",
+                "type": proposed_type,
+                "enabled": bool(observium_port.get("enabled_candidate")) if observium_port.get("enabled_candidate") is not None else True,
+                "description": observium_port.get("description") or "",
+                "mtu": as_int(observium_port.get("mtu")),
+                "lag_name": lag_parent_name,
+                "vlans": observium_port.get("vlans") or [],
+            }
+        connection = await resolve_interface_connection_candidate(
+            local_interface=item.get("netbox"),
+            local_observium_port=observium_port,
+            link_rows=link_rows_by_port_id,
+        )
+        item["connection"] = connection
+        if connection and item["status"] == "matched":
+            remote_nb_iface = connection.get("remote_netbox_interface") or {}
+            current_peer = connection.get("current_peer") or {}
+            if remote_nb_iface.get("id") and as_int(current_peer.get("id")) != as_int(remote_nb_iface.get("id")):
+                item["actions"].append(
+                    {
+                        "field": "connection",
+                        "current": compact_text(
+                            " ".join(
+                                part for part in [current_peer.get("device_name"), current_peer.get("name")] if compact_text(part)
+                            )
+                        ),
+                        "proposed": compact_text(
+                            " ".join(
+                                part for part in [
+                                    ((connection.get("remote_netbox_device") or {}).get("name")),
+                                    remote_nb_iface.get("name"),
+                                ] if compact_text(part)
+                            )
+                        ),
+                    }
+                )
+    ready = sum(1 for item in matched if item["actions"])
+    up_to_date = sum(1 for item in matched if not item["actions"])
+    unmatched_observium = sum(1 for item in matches if item["status"] == "unmatched_observium")
+    unmatched_netbox = sum(1 for item in matches if item["status"] == "unmatched_netbox")
+
+    return {
+        "device": {"id": int(device["id"]), "name": device.get("name")},
+        "correlation": sources["correlation"],
+        "observium_device": {
+            "device_id": str(observium_device.get("device_id")),
+            "hostname": observium_device.get("hostname"),
+            "sysName": observium_device.get("sysName"),
+        },
+        "summary": {
+            "netbox_interfaces": len(netbox_interfaces),
+            "observium_ports": len(observium_ports),
+            "matched": len(matched),
+            "ready": ready,
+            "up_to_date": up_to_date,
+            "unmatched_observium": unmatched_observium,
+            "unmatched_netbox": unmatched_netbox,
+            "creatable": unmatched_observium,
+        },
+        "interfaces": matches,
+    }
+
+
+async def ensure_netbox_interface_mac(interface_id: int, address: str) -> dict[str, Any]:
+    normalized = parse_mac_address(address)
+    if not normalized:
+        raise HTTPException(400, "MAC candidate is empty")
+    existing = await netbox_paginated(
+        "/dcim/mac-addresses/",
+        {"assigned_object_type": "dcim.interface", "assigned_object_id": interface_id, "limit": 100},
+    )
+    current = next((item for item in existing if parse_mac_address(item.get("mac_address")) == normalized), None)
+    created = False
+    if current is None:
+        created_result = await netbox_request(
+            "POST",
+            "/dcim/mac-addresses/",
+            {
+                "mac_address": normalized,
+                "assigned_object_type": "dcim.interface",
+                "assigned_object_id": interface_id,
+            },
+        )
+        current = created_result.get("result") or created_result.get("response") or {}
+        created = True
+    if current.get("id") is not None:
+        await netbox_request("PATCH", f"/dcim/interfaces/{interface_id}/", {"primary_mac_address": int(current["id"])})
+    return {"created": created, "mac": current}
+
+
+async def apply_netbox_interface_sync(device_id: int, options: NetBoxInterfaceSyncRunPayload) -> dict[str, Any]:
+    device_result = await netbox_request("GET", f"/dcim/devices/{device_id}/")
+    device = device_result.get("result") or device_result.get("response") or {}
+    sources = await correlated_sources_for_netbox_device(device_id)
+    replacement_cleanup = None
+    if options.replace_existing_interfaces:
+        existing_interfaces = await netbox_paginated("/dcim/interfaces/", {"device_id": device_id, "limit": 500})
+        replacement_cleanup = await clear_netbox_interface_dependencies(device_id, existing_interfaces)
+    preview = await build_netbox_interface_sync_preview(device_id)
+    results: list[dict[str, Any]] = []
+    created_port_ids: set[int] = set()
+    created_interfaces_by_name: dict[str, int] = {}
+    create_missing_interfaces = options.create_missing_interfaces or options.replace_existing_interfaces
+
+    create_items = [
+        item
+        for item in preview["interfaces"]
+        if item["status"] == "unmatched_observium"
+    ]
+    create_items.sort(key=lambda item: 0 if (item.get("observium", {}).get("lag_role") == "parent") else 1)
+
+    for item in create_items:
+        if not create_missing_interfaces:
+            break
+        create_payload = dict(item.get("create_payload") or {})
+        if not create_payload:
+            continue
+        lag_name = compact_text(create_payload.pop("lag_name"))
+        vlan_ids = [str(vlan) for vlan in create_payload.pop("vlans", []) if compact_text(vlan)]
+        mtu = create_payload.get("mtu")
+        if not mtu:
+            create_payload.pop("mtu", None)
+        try:
+            created = await netbox_request("POST", "/dcim/interfaces/", create_payload)
+            created_iface = created.get("result") or created.get("response") or {}
+            iface_id = int(created_iface["id"])
+            created_interfaces_by_name[normalize_key(create_payload.get("name"))] = iface_id
+            patch_payload: dict[str, Any] = {}
+            if options.sync_vlan_tags and vlan_ids:
+                ensured_tag_ids = await ensure_vlan_tags(vlan_ids)
+                patch_payload["tags"] = merge_interface_vlan_tags(created_iface.get("tags") or [], ensured_tag_ids)
+            if options.sync_mac_addresses and item.get("observium", {}).get("mac_address"):
+                await ensure_netbox_interface_mac(iface_id, item["observium"]["mac_address"])
+            if options.sync_lag_members and lag_name:
+                interfaces = await netbox_paginated("/dcim/interfaces/", {"device_id": device_id, "limit": 500})
+                parent = next((iface for iface in interfaces if normalize_key(iface.get("name")) == normalize_key(lag_name)), None)
+                if parent is None and created_interfaces_by_name.get(normalize_key(lag_name)):
+                    parent = {"id": created_interfaces_by_name[normalize_key(lag_name)]}
+                if parent:
+                    patch_payload["lag"] = int(parent["id"])
+            if patch_payload:
+                await netbox_request("PATCH", f"/dcim/interfaces/{iface_id}/", patch_payload)
+            connection = item.get("connection") or {}
+            remote_interface = (connection.get("remote_netbox_interface") or {}) if isinstance(connection, dict) else {}
+            if options.sync_connections and remote_interface.get("id"):
+                try:
+                    await ensure_netbox_interface_cable(iface_id, int(remote_interface["id"]))
+                except HTTPException as exc:
+                    results.append({"status": "error", "name": create_payload.get("name"), "payload": create_payload, "error": exc.detail, "phase": "cable"})
+            if item.get("observium", {}).get("port_id"):
+                created_port_ids.add(int(item["observium"]["port_id"]))
+            results.append({"status": "created", "name": create_payload.get("name"), "netbox_interface_id": iface_id, "payload": create_payload})
+        except HTTPException as exc:
+            results.append({"status": "error", "name": create_payload.get("name"), "payload": create_payload, "error": exc.detail})
+
+    for item in preview["interfaces"]:
+        if item["status"] != "matched":
+            if item["status"] == "unmatched_observium" and item.get("observium", {}).get("port_id") and int(item["observium"]["port_id"]) in created_port_ids:
+                continue
+            results.append({"status": "skipped", "reason": item["status"], "netbox": item.get("netbox"), "observium": item.get("observium")})
+            continue
+        if not item["actions"]:
+            results.append({"status": "skipped", "reason": "up_to_date", "netbox": item.get("netbox"), "observium": item.get("observium")})
+            continue
+
+        netbox_interface = item["netbox"] or {}
+        observium_port = item["observium"] or {}
+        payload: dict[str, Any] = {}
+
+        if options.rename_interfaces and any(action["field"] == "name" for action in item["actions"]):
+            payload["name"] = observium_port["name"]
+        if options.sync_descriptions and any(action["field"] == "description" for action in item["actions"]):
+            payload["description"] = observium_port["description"]
+        if options.sync_enabled_state and any(action["field"] == "enabled" for action in item["actions"]):
+            payload["enabled"] = bool(observium_port["enabled_candidate"])
+        if options.sync_type and any(action["field"] == "type" for action in item["actions"]):
+            payload["type"] = observium_port["type"]
+        if options.sync_mtu and any(action["field"] == "mtu" for action in item["actions"]):
+            payload["mtu"] = as_int(observium_port["mtu"])
+        if options.sync_vlan_tags and any(action["field"] == "vlan_tags" for action in item["actions"]):
+            ensured_tag_ids = await ensure_vlan_tags(observium_port.get("vlans") or [])
+            payload["tags"] = merge_interface_vlan_tags(netbox_interface.get("tags") or [], ensured_tag_ids)
+        if options.sync_lag_members and any(action["field"] == "lag" for action in item["actions"]):
+            parent_name = compact_text(item.get("lag_parent_name"))
+            if parent_name:
+                interfaces = await netbox_paginated("/dcim/interfaces/", {"device_id": device_id, "limit": 500})
+                parent = next((iface for iface in interfaces if normalize_key(iface.get("name")) == normalize_key(parent_name)), None)
+                if parent:
+                    payload["lag"] = int(parent["id"])
+
+        if not payload:
+            results.append({"status": "skipped", "reason": "disabled_by_options", "netbox": netbox_interface, "observium": observium_port})
+            continue
+
+        try:
+            if payload:
+                updated = await netbox_request("PATCH", f"/dcim/interfaces/{int(netbox_interface['id'])}/", payload)
+                updated_iface = updated.get("result") or updated.get("response") or {}
+            else:
+                updated_iface = netbox_interface
+            mac_result = None
+            if options.sync_mac_addresses and any(action["field"] == "mac_address" for action in item["actions"]):
+                mac_result = await ensure_netbox_interface_mac(int(netbox_interface["id"]), observium_port["mac_address"])
+            cable_result = None
+            if options.sync_connections and any(action["field"] == "connection" for action in item["actions"]):
+                remote_interface = ((item.get("connection") or {}).get("remote_netbox_interface") or {})
+                if remote_interface.get("id"):
+                    cable_result = await ensure_netbox_interface_cable(int(netbox_interface["id"]), int(remote_interface["id"]))
+            results.append(
+                {
+                    "status": "updated",
+                    "match_method": item.get("match_method"),
+                    "netbox_interface_id": int(netbox_interface["id"]),
+                    "name": updated_iface.get("name") or netbox_interface.get("name"),
+                    "payload": payload,
+                    "mac_result": mac_result,
+                    "cable_result": cable_result,
+                }
+            )
+        except HTTPException as exc:
+            results.append(
+                {
+                    "status": "error",
+                    "match_method": item.get("match_method"),
+                    "netbox_interface_id": int(netbox_interface["id"]),
+                    "name": netbox_interface.get("name"),
+                    "payload": payload,
+                    "error": exc.detail,
+                }
+            )
+
+    primary_ip_result = None
+    if options.reassign_primary_ip:
+        candidate_ip = pick_management_ip_candidate(device, sources)
+        if compact_text(candidate_ip):
+            try:
+                primary_ip_result = await ensure_netbox_primary_ip4(
+                    device,
+                    candidate_ip,
+                    preferred_interface_name=options.management_interface_name or "VLAN 200",
+                )
+            except HTTPException as exc:
+                results.append(
+                    {
+                        "status": "error",
+                        "phase": "primary_ip",
+                        "name": preview["device"]["name"],
+                        "payload": {"address": candidate_ip, "management_interface_name": options.management_interface_name or "VLAN 200"},
+                        "error": exc.detail,
+                    }
+                )
+        else:
+            results.append(
+                {
+                    "status": "skipped",
+                    "reason": "missing_primary_ip_candidate",
+                    "name": preview["device"]["name"],
+                }
+            )
+
+    success_count = sum(1 for item in results if item["status"] == "updated")
+    created_count = sum(1 for item in results if item["status"] == "created")
+    error_count = sum(1 for item in results if item["status"] == "error")
+    log_export(
+        action="netbox-interface-sync",
+        source="observium",
+        target="netbox",
+        status="error" if error_count else "ok",
+        entity_id=str(device_id),
+        entity_label=preview["device"]["name"],
+        message=f"updated={success_count} created={created_count} errors={error_count}",
+        payload={"options": options.dict(), "preview": preview},
+        response=results,
+    )
+    return {
+        "preview": await build_netbox_interface_sync_preview(device_id),
+        "results": results,
+        "options": options.dict(),
+        "cleanup": replacement_cleanup,
+        "primary_ip": primary_ip_result,
+    }
+
+
+def interface_sync_lock(device_id: int) -> asyncio.Lock:
+    lock = _interface_sync_locks.get(device_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _interface_sync_locks[device_id] = lock
+    return lock
 
 
 async def zabbix_host_items(host_id: str) -> list[dict[str, Any]]:
@@ -1049,17 +2280,54 @@ async def choose_primary_interface(device_id: int) -> dict[str, Any]:
     if interfaces:
         def score(item: dict[str, Any]) -> tuple[int, int]:
             name = compact_text(item.get("name")).lower()
-            if any(token in name for token in ("mgmt", "management", "oob")):
+            if "vlan200" in name or "vlan 200" in name:
                 return (0, 0)
-            if "vlan1" in name or "vlan 1" in name:
+            if any(token in name for token in ("mgmt", "management", "oob")):
                 return (1, 0)
-            return (2, int(not item.get("enabled", True)))
+            if "vlan1" in name or "vlan 1" in name:
+                return (2, 0)
+            if name.startswith("vlan "):
+                return (3, 0)
+            return (4, int(not item.get("enabled", True)))
         return sorted(interfaces, key=score)[0]
 
     created = await netbox_request(
         "POST",
         "/dcim/interfaces/",
         {"device": int(device_id), "name": "mgmt0", "type": "virtual", "enabled": True},
+    )
+    return created.get("result") or created.get("response") or {}
+
+
+async def choose_management_interface(device_id: int, preferred_name: Optional[str] = None) -> dict[str, Any]:
+    interfaces = await netbox_paginated("/dcim/interfaces/", {"device_id": device_id, "limit": 500})
+    preferred = compact_text(preferred_name)
+    if preferred:
+        exact = next((item for item in interfaces if normalize_key(item.get("name")) == normalize_key(preferred)), None)
+        if exact:
+            return exact
+
+    if interfaces:
+        def score(item: dict[str, Any]) -> tuple[int, int]:
+            name = compact_text(item.get("name")).lower()
+            if preferred and normalize_key(name) == normalize_key(preferred):
+                return (0, 0)
+            if "vlan200" in name or "vlan 200" in name:
+                return (1, 0)
+            if any(token in name for token in ("mgmt", "management", "oob")):
+                return (2, 0)
+            if "vlan1" in name or "vlan 1" in name:
+                return (3, 0)
+            if name.startswith("vlan "):
+                return (4, 0)
+            return (5, int(not item.get("enabled", True)))
+        return sorted(interfaces, key=score)[0]
+
+    created_name = preferred or "VLAN 200"
+    created = await netbox_request(
+        "POST",
+        "/dcim/interfaces/",
+        {"device": int(device_id), "name": created_name, "type": "virtual", "enabled": True},
     )
     return created.get("result") or created.get("response") or {}
 
@@ -1076,12 +2344,17 @@ async def ip_assigned_device(ip_payload: dict[str, Any]) -> Optional[int]:
     return None
 
 
-async def ensure_netbox_primary_ip4(device: dict[str, Any], address: str, status: str = "active") -> dict[str, Any]:
+async def ensure_netbox_primary_ip4(
+    device: dict[str, Any],
+    address: str,
+    status: str = "active",
+    preferred_interface_name: Optional[str] = None,
+) -> dict[str, Any]:
     normalized = normalize_ip_value(address)
     if not normalized:
         raise HTTPException(400, "IPv4 candidate is empty")
 
-    chosen_interface = await choose_primary_interface(int(device["id"]))
+    chosen_interface = await choose_management_interface(int(device["id"]), preferred_interface_name) if preferred_interface_name else await choose_primary_interface(int(device["id"]))
     search_results = await netbox_paginated("/ipam/ip-addresses/", {"address": host_part(normalized), "limit": 50})
 
     reusable = None
@@ -1125,6 +2398,711 @@ async def ensure_netbox_primary_ip4(device: dict[str, Any], address: str, status
 
     await netbox_set_primary_ip(int(device["id"]), {"ip_id": ip_id})
     return {"ip_id": ip_id, "address": normalized, "created": created, "interface": chosen_interface}
+
+
+def pick_management_ip_candidate(device: dict[str, Any], sources: dict[str, Any]) -> str:
+    current_primary = compact_text(((device.get("primary_ip4") or {}).get("address")) or "")
+    if current_primary:
+        return current_primary
+    description_ip = description_ip_candidate(device)
+    if description_ip:
+        return description_ip
+    zabbix_ip = extract_main_zabbix_ip(sources.get("zabbix") or {})
+    if zabbix_ip:
+        return zabbix_ip
+    return extract_observium_ipv4(sources.get("observium") or {}) or ""
+
+
+async def clear_netbox_interface_dependencies(device_id: int, interfaces: list[dict[str, Any]]) -> dict[str, Any]:
+    interface_ids = {int(item["id"]) for item in interfaces if item.get("id") is not None}
+    if not interface_ids:
+        return {"interfaces_deleted": 0, "ips_unassigned": 0, "cables_deleted": 0, "macs_deleted": 0}
+
+    device_result = await netbox_request("GET", f"/dcim/devices/{device_id}/")
+    device = device_result.get("result") or device_result.get("response") or {}
+    primary_clear: dict[str, Any] = {}
+    for field in ("primary_ip4", "primary_ip6"):
+        primary_ip = device.get(field) or {}
+        if as_int(primary_ip.get("id")) is not None:
+            primary_clear[field] = None
+    if primary_clear:
+        await netbox_request("PATCH", f"/dcim/devices/{device_id}/", primary_clear)
+
+    ips = await netbox_paginated("/ipam/ip-addresses/", {"device_id": device_id, "limit": 500})
+    ips_unassigned = 0
+    for ip_item in ips:
+        assigned_object = ip_item.get("assigned_object") or {}
+        if as_int(assigned_object.get("id")) not in interface_ids:
+            continue
+        await netbox_request(
+            "PATCH",
+            f"/ipam/ip-addresses/{int(ip_item['id'])}/",
+            {"assigned_object_type": None, "assigned_object_id": None},
+        )
+        ips_unassigned += 1
+
+    cables_deleted = 0
+    macs_deleted = 0
+    interfaces_deleted = 0
+    for interface in interfaces:
+        iface_id = int(interface["id"])
+        detail_result = await netbox_request("GET", f"/dcim/interfaces/{iface_id}/")
+        detail = detail_result.get("result") or detail_result.get("response") or {}
+        cable = detail.get("cable") or {}
+        cable_id = as_int(cable.get("id"))
+        if cable_id:
+            await netbox_request("DELETE", f"/dcim/cables/{cable_id}/")
+            cables_deleted += 1
+        macs = await netbox_paginated(
+            "/dcim/mac-addresses/",
+            {"assigned_object_type": "dcim.interface", "assigned_object_id": iface_id, "limit": 100},
+        )
+        for mac in macs:
+            if mac.get("id") is None:
+                continue
+            await netbox_request("DELETE", f"/dcim/mac-addresses/{int(mac['id'])}/")
+            macs_deleted += 1
+        await netbox_request("DELETE", f"/dcim/interfaces/{iface_id}/")
+        interfaces_deleted += 1
+
+    return {
+        "interfaces_deleted": interfaces_deleted,
+        "ips_unassigned": ips_unassigned,
+        "cables_deleted": cables_deleted,
+        "macs_deleted": macs_deleted,
+    }
+
+
+async def netbox_find_device_type_by_model(model: str) -> Optional[dict[str, Any]]:
+    target = normalize_key(model)
+    if not target:
+        return None
+    for item in await netbox_paginated("/dcim/device-types/", {"limit": 500}):
+        if normalize_key(item.get("model")) == target or normalize_key(item.get("display")) == target:
+            return item
+    return None
+
+
+async def ensure_netbox_device_type(model: str, manufacturer_name: str) -> dict[str, Any]:
+    existing = await netbox_find_device_type_by_model(model)
+    if existing:
+        return {"created": False, "device_type": existing}
+    manufacturer_result = await ensure_netbox_manufacturer(manufacturer_name or "Unknown Vendor")
+    manufacturer = manufacturer_result.get("manufacturer") or {}
+    if not manufacturer.get("id"):
+        raise HTTPException(400, "Manufacturer could not be created in NetBox")
+    created = await netbox_request(
+        "POST",
+        "/dcim/device-types/",
+        {
+            "manufacturer": int(manufacturer["id"]),
+            "model": model,
+            "slug": slugify_text(model)[:100],
+        },
+    )
+    return {
+        "created": True,
+        "manufacturer_created": manufacturer_result.get("created", False),
+        "device_type": created.get("result") or created.get("response") or {},
+        "manufacturer": manufacturer,
+    }
+
+
+async def netbox_find_device_by_mac(mac_address: str) -> Optional[dict[str, Any]]:
+    normalized = parse_mac_address(mac_address)
+    if not normalized:
+        return None
+    mac_rows = await netbox_paginated("/dcim/mac-addresses/", {"mac_address": normalized, "limit": 50})
+    for row in mac_rows:
+        assigned = row.get("assigned_object") or {}
+        device = assigned.get("device") or {}
+        if device.get("id") is not None:
+            device_result = await netbox_request("GET", f"/dcim/devices/{int(device['id'])}/")
+            return device_result.get("result") or None
+    return None
+
+
+async def netbox_find_device_by_identity(name: str, ip_value: str = "", mac_address: str = "") -> Optional[dict[str, Any]]:
+    target_name = normalize_key(name)
+    target_ip = host_part(ip_value) if ip_value else ""
+    if mac_address:
+        by_mac = await netbox_find_device_by_mac(mac_address)
+        if by_mac:
+            return by_mac
+    for item in await fetch_all_netbox_devices(archived="all"):
+        if target_name and normalize_key(item.get("name")) == target_name:
+            return item
+        item_ip = host_part((item.get("primary_ip4") or {}).get("address") or "")
+        if target_ip and item_ip == target_ip:
+            return item
+    return None
+
+
+async def zabbix_find_host_by_identity(name: str, ip_value: str = "", mac_address: str = "") -> Optional[dict[str, Any]]:
+    hosts = (await zabbix_hosts(limit=1000, archived="all")).get("result") or []
+    target_name = normalize_key(name)
+    target_ip = host_part(ip_value) if ip_value else ""
+    target_mac = parse_mac_address(mac_address)
+    for host in hosts:
+        if target_name and normalize_key(host.get("host")) == target_name:
+            return host
+        host_ip = host_part(extract_main_zabbix_ip(host) or "")
+        if target_ip and host_ip == target_ip:
+            return host
+        inventory = host.get("inventory") or {}
+        for key in ("macaddress_a", "macaddress_b", "macaddress_c"):
+            if target_mac and parse_mac_address(inventory.get(key)) == target_mac:
+                return host
+    return None
+
+
+def observium_find_device_by_mac(mac_address: str) -> Optional[dict[str, Any]]:
+    normalized = parse_mac_address(mac_address)
+    if not normalized or not observium_table_exists("ports"):
+        return None
+    try:
+        row = observium_db_query(
+            """
+            SELECT device_id
+            FROM ports
+            WHERE REPLACE(UPPER(COALESCE(ifPhysAddress, '')), '-', '') = REPLACE(%s, ':', '')
+            LIMIT 1
+            """,
+            (normalized,),
+            fetch="one",
+        )
+    except Exception:
+        row = None
+    if not row:
+        return None
+    return observium_device_row(int(row["device_id"]))
+
+
+async def observium_find_device_by_identity(name: str, ip_value: str = "", mac_address: str = "") -> Optional[dict[str, Any]]:
+    target_name = normalize_key(name)
+    target_ip = host_part(ip_value) if ip_value else ""
+    if mac_address:
+        by_mac = observium_find_device_by_mac(mac_address)
+        if by_mac:
+            return by_mac
+    rows = observium_db_query("SELECT device_id FROM devices ORDER BY device_id DESC")
+    for row in rows or []:
+        device = observium_device_row(int(row["device_id"]))
+        if not device:
+            continue
+        if target_name and (normalize_key(device.get("hostname")) == target_name or normalize_key(device.get("sysName")) == target_name):
+            return device
+        if target_ip and host_part(device.get("ip") or "") == target_ip:
+            return device
+    return None
+
+
+def observium_link_rows(local_device_id: int) -> list[dict[str, Any]]:
+    if observium_table_exists("links"):
+        columns = observium_table_columns("links")
+        local_device_col = find_table_column(columns, "local_device_id", "device_id", "device_id_local")
+        local_port_col = find_table_column(columns, "local_port_id", "port_id", "port_id_local")
+        if not local_device_col or not local_port_col:
+            return []
+        try:
+            return observium_db_query(
+                f"SELECT * FROM links WHERE {local_device_col} = %s",
+                (local_device_id,),
+            )
+        except Exception:
+            return []
+
+    if observium_table_exists("neighbours"):
+        columns = observium_table_columns("neighbours")
+        local_device_col = find_table_column(columns, "device_id", "local_device_id", "device_id_local")
+        local_port_col = find_table_column(columns, "port_id", "local_port_id", "port_id_local")
+        if not local_device_col or not local_port_col:
+            return []
+        active_col = find_table_column(columns, "active")
+        where_clauses = [f"{local_device_col} = %s"]
+        params: list[Any] = [local_device_id]
+        if active_col:
+            where_clauses.append(f"{active_col} = %s")
+            params.append(1)
+        try:
+            rows = observium_db_query(
+                f"SELECT * FROM neighbours WHERE {' AND '.join(where_clauses)}",
+                tuple(params),
+            )
+        except Exception:
+            return []
+        normalized_rows: list[dict[str, Any]] = []
+        for row in rows or []:
+            item = dict(row)
+            item.setdefault("local_device_id", item.get(local_device_col))
+            item.setdefault("local_port_id", item.get(local_port_col))
+            item.setdefault("remote_device_id", item.get("remote_device_id"))
+            item.setdefault("remote_port_id", item.get("remote_port_id"))
+            item.setdefault("protocol", item.get("protocol") or "lldp")
+            normalized_rows.append(item)
+        return normalized_rows
+
+    return []
+
+
+def observium_mac_ip_rows(mac_address: str) -> list[dict[str, Any]]:
+    normalized = parse_mac_address(mac_address)
+    if not normalized:
+        return []
+    queries: list[tuple[str, tuple[Any, ...]]] = []
+    if observium_table_exists("ipv4_mac"):
+        queries.append(
+            (
+                """
+                SELECT *
+                FROM ipv4_mac
+                WHERE REPLACE(UPPER(COALESCE(mac_address, '')), '-', '') = REPLACE(%s, ':', '')
+                """,
+                (normalized,),
+            )
+        )
+    if observium_table_exists("arp_table"):
+        queries.append(
+            (
+                """
+                SELECT *
+                FROM arp_table
+                WHERE REPLACE(UPPER(COALESCE(mac_address, '')), '-', '') = REPLACE(%s, ':', '')
+                """,
+                (normalized,),
+            )
+        )
+    rows: list[dict[str, Any]] = []
+    for query, params in queries:
+        try:
+            rows.extend(observium_db_query(query, params) or [])
+        except Exception:
+            continue
+    return rows
+
+
+def observium_ip_from_mac(mac_address: str) -> str:
+    for row in observium_mac_ip_rows(mac_address):
+        for key in ("ipv4_address", "ip_address", "address", "ip"):
+            candidate = compact_text(row.get(key))
+            if candidate:
+                return host_part(candidate)
+    return ""
+
+
+def observium_link_neighbor_mac(row: dict[str, Any]) -> str:
+    for key in ("remote_ifPhysAddress", "remote_mac", "peer_mac", "remote_port_mac", "lldpRemChassisId"):
+        value = parse_mac_address(row.get(key))
+        if value:
+            return value
+    return ""
+
+
+def observium_link_neighbor_name(row: dict[str, Any]) -> str:
+    for key in ("remote_hostname", "remote_sysName", "remote_name", "lldpRemSysName", "remote_device"):
+        value = compact_text(row.get(key))
+        if value:
+            return value
+    return ""
+
+
+async def resolve_lldp_source(body: DiscoveryLldpPreviewPayload | DiscoveryLldpApplyPayload) -> dict[str, Any]:
+    source = compact_text(body.source).lower()
+    source_id = str(body.source_id).strip()
+    if source not in {"observium", "zabbix"}:
+        raise HTTPException(400, "LLDP source must be observium or zabbix")
+    if not source_id:
+        raise HTTPException(400, "source_id is required")
+
+    zabbix_host = None
+    observium_device = None
+
+    if source == "observium":
+        observium_device = observium_device_row(int(source_id))
+        if not observium_device:
+            raise HTTPException(404, "Observium source device was not found")
+        zabbix_host = await zabbix_find_host_by_identity(
+            observium_device.get("sysName") or observium_device.get("hostname") or "",
+            observium_device.get("ip") or "",
+        )
+    else:
+        zabbix_result = await zabbix_request(
+            "host.get",
+            {
+                "output": "extend",
+                "hostids": [source_id],
+                "selectInterfaces": "extend",
+                "selectInventory": "extend",
+                "selectTags": "extend",
+                "selectMacros": "extend",
+            },
+        )
+        zabbix_host = (zabbix_result.get("result") or [None])[0]
+        if not zabbix_host:
+            raise HTTPException(404, "Zabbix source host was not found")
+        observium_device = await observium_find_device_by_identity(
+            zabbix_host.get("host") or zabbix_host.get("name") or "",
+            extract_main_zabbix_ip(zabbix_host) or "",
+        )
+        correlation = find_correlation_by_item("zabbix", source_id)
+        if not observium_device and correlation and (correlation.get("items") or {}).get("observium"):
+            observium_device = observium_device_row(int(correlation["items"]["observium"]["id"]))
+
+    if not observium_device:
+        raise HTTPException(404, "No Observium device could be resolved for the selected source")
+
+    return {"source": source, "source_id": source_id, "zabbix": zabbix_host, "observium": observium_device}
+
+
+async def build_lldp_neighbor_candidate(
+    *,
+    local_source: dict[str, Any],
+    local_port: Optional[dict[str, Any]],
+    link_row: dict[str, Any],
+    remote_device: Optional[dict[str, Any]],
+    remote_port: Optional[dict[str, Any]],
+) -> Optional[dict[str, Any]]:
+    remote_mac = observium_link_neighbor_mac(link_row) or parse_mac_address((remote_port or {}).get("mac_address"))
+    remote_ip = ""
+    if remote_device:
+        remote_ip = host_part(remote_device.get("ip") or "")
+    if not remote_ip and remote_mac:
+        remote_ip = observium_ip_from_mac(remote_mac)
+    remote_name = (
+        compact_text((remote_device or {}).get("sysName"))
+        or compact_text((remote_device or {}).get("hostname"))
+        or compact_text((remote_port or {}).get("description"))
+        or observium_link_neighbor_name(link_row)
+    )
+    if not remote_name and not remote_mac and not remote_ip:
+        return None
+
+    existing_netbox = await netbox_find_device_by_identity(remote_name, remote_ip, remote_mac)
+    existing_zabbix = await zabbix_find_host_by_identity(remote_name, remote_ip, remote_mac)
+    existing_observium = remote_device or await observium_find_device_by_identity(remote_name, remote_ip, remote_mac)
+
+    manufacturer_name = compact_text((existing_observium or {}).get("vendor")) or "Unknown Vendor"
+    model_name = compact_text((existing_observium or {}).get("hardware")) or remote_name
+    create_candidate = {
+        "name": remote_name or (remote_ip or remote_mac or "lldp-neighbor"),
+        "manufacturer_name": manufacturer_name,
+        "model_name": model_name,
+        "platform_name": build_observium_platform_label(existing_observium),
+        "serial": compact_text((existing_observium or {}).get("serial")),
+        "primary_ip4": normalize_ip_value(remote_ip) if remote_ip else "",
+        "description": build_observium_platform_label(existing_observium),
+    }
+    return {
+        "id": f"{local_source['observium']['device_id']}:{(local_port or {}).get('port_id') or 0}:{remote_name or remote_mac or remote_ip}",
+        "protocol": compact_text(first_non_empty(link_row, "protocol", "link_type")) or "LLDP/CDP",
+        "local_port": local_port,
+        "remote_port": remote_port,
+        "neighbor": {
+            "name": remote_name,
+            "ip": remote_ip,
+            "mac_address": remote_mac,
+        },
+        "matches": {
+            "netbox": existing_netbox,
+            "zabbix": existing_zabbix,
+            "observium": existing_observium,
+        },
+        "status": "matched" if (existing_netbox or existing_zabbix or existing_observium) else "proposed_create",
+        "create_candidate": create_candidate,
+    }
+
+
+async def build_lldp_discovery_preview(body: DiscoveryLldpPreviewPayload | DiscoveryLldpApplyPayload) -> dict[str, Any]:
+    source_ctx = await resolve_lldp_source(body)
+    observium_device = source_ctx["observium"]
+    ports = observium_port_rows(int(observium_device["device_id"]))
+    ports_by_id = {int(port["port_id"]): port for port in ports if port.get("port_id")}
+    rows = observium_link_rows(int(observium_device["device_id"]))
+    proposals: list[dict[str, Any]] = []
+    for row in rows:
+        local_port_id = as_int(first_non_empty(row, "local_port_id", "port_id", "port_id_local")) or 0
+        local_port = ports_by_id.get(local_port_id)
+        remote_device_id = as_int(first_non_empty(row, "remote_device_id", "peer_device_id", "device_id_remote"))
+        remote_port_id = as_int(first_non_empty(row, "remote_port_id", "peer_port_id", "port_id_remote"))
+        remote_device = observium_device_row(remote_device_id) if remote_device_id else None
+        remote_ports = observium_port_rows(remote_device_id) if remote_device_id else []
+        remote_port = next((item for item in remote_ports if int(item.get("port_id") or 0) == remote_port_id), None)
+        candidate = await build_lldp_neighbor_candidate(
+            local_source=source_ctx,
+            local_port=local_port,
+            link_row=row,
+            remote_device=remote_device,
+            remote_port=remote_port,
+        )
+        if candidate:
+            proposals.append(candidate)
+    return {
+        "source": {
+            "platform": source_ctx["source"],
+            "source_id": source_ctx["source_id"],
+            "zabbix": source_ctx["zabbix"],
+            "observium": source_ctx["observium"],
+        },
+        "summary": {
+            "links": len(proposals),
+            "matched": sum(1 for item in proposals if item["status"] == "matched"),
+            "proposed_create": sum(1 for item in proposals if item["status"] == "proposed_create"),
+        },
+        "proposals": proposals,
+    }
+
+
+async def apply_lldp_discovery(body: DiscoveryLldpApplyPayload) -> dict[str, Any]:
+    preview = await build_lldp_discovery_preview(body)
+    selected = set(body.proposal_ids or [])
+    results: list[dict[str, Any]] = []
+    for item in preview["proposals"]:
+        if selected and item["id"] not in selected:
+            continue
+        if item["status"] != "proposed_create":
+            results.append({"status": "skipped", "id": item["id"], "reason": item["status"]})
+            continue
+        if not body.site_id or not body.role_id:
+            results.append({"status": "error", "id": item["id"], "error": "Site and role are required to create LLDP proposals in NetBox"})
+            continue
+        candidate = item.get("create_candidate") or {}
+        ensured_device_type = await ensure_netbox_device_type(candidate.get("model_name") or candidate.get("name") or "Unknown Model", candidate.get("manufacturer_name") or "Unknown Vendor")
+        device_type = ensured_device_type.get("device_type") or {}
+        payload = {
+            "name": candidate.get("name"),
+            "status": "active",
+            "site": int(body.site_id),
+            "role": int(body.role_id),
+            "device_type": int(device_type["id"]),
+            "serial": candidate.get("serial") or "",
+            "description": candidate.get("description") or "",
+        }
+        try:
+            created = await netbox_request("POST", "/dcim/devices/", payload)
+            created_device = created.get("result") or created.get("response") or {}
+            if candidate.get("platform_name"):
+                ensured_platform = await ensure_netbox_platform(candidate["platform_name"])
+                platform = ensured_platform.get("platform") or {}
+                if platform.get("id"):
+                    await netbox_request("PATCH", f"/dcim/devices/{int(created_device['id'])}/", {"platform": int(platform["id"])})
+            if candidate.get("primary_ip4"):
+                await ensure_netbox_primary_ip4(created_device, candidate["primary_ip4"])
+            results.append({"status": "created", "id": item["id"], "device": created_device, "payload": payload, "device_type": device_type})
+        except HTTPException as exc:
+            results.append({"status": "error", "id": item["id"], "error": exc.detail, "payload": payload})
+    return {"preview": await build_lldp_discovery_preview(body), "results": results}
+
+
+def parse_snmp_value(output: str) -> str:
+    text = compact_text(output)
+    return text.strip("\"'")
+
+
+def snmp_exec_args(payload: NetBoxSnmpProbePayload, oid: str, walk: bool = False) -> list[str]:
+    command = "snmpwalk" if walk else "snmpget"
+    args = [command, "-Oqv", f"-{payload.snmp_version}", "-t", "2", "-r", "1"]
+    if payload.snmp_version == "v3":
+        raise HTTPException(400, "SNMP v3 probe is not implemented yet")
+    args.extend(["-c", payload.snmp_community or "public", payload.ip, oid])
+    return args
+
+
+def snmp_probe_value(payload: NetBoxSnmpProbePayload, oid: str, walk: bool = False) -> str:
+    result = observium_exec_result(snmp_exec_args(payload, oid, walk=walk))
+    if result["exit_code"] != 0:
+        return ""
+    if walk:
+        for line in result["output"].splitlines():
+            value = parse_snmp_value(line)
+            if value and "no such" not in value.lower():
+                return value
+        return ""
+    value = parse_snmp_value(result["output"])
+    return "" if "no such" in value.lower() else value
+
+
+def infer_vendor_from_snmp(sys_descr: str, sys_object_id: str) -> str:
+    signature = f"{sys_descr} {sys_object_id}".lower()
+    if "forti" in signature:
+        return "Fortinet"
+    if "cisco" in signature:
+        return "Cisco"
+    if "allied" in signature:
+        return "Allied Telesis"
+    if "avaya" in signature or ".1.3.6.1.4.1.45." in signature or "ethernet routing switch" in signature:
+        return "Extreme Networks"
+    if "aruba" in signature or "procurve" in signature or "hpe" in signature:
+        return "HPE Aruba"
+    return ""
+
+
+def infer_model_from_snmp(sys_descr: str) -> str:
+    patterns = [
+        r"(Ethernet Routing Switch\s+[A-Za-z0-9\-\+]+)",
+        r"(FortiSwitch\s+[A-Za-z0-9\-]+)",
+        r"(FortiGate\s+[A-Za-z0-9\-]+)",
+        r"(C9[0-9A-Za-z\-]+)",
+        r"(WS-C[0-9A-Za-z\-]+)",
+        r"(AT-[A-Za-z0-9\-]+)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, sys_descr, re.IGNORECASE)
+        if match:
+            return compact_text(match.group(1))
+    return compact_text(sys_descr.split(",")[0])
+
+
+def official_reference_url(vendor: str, model: str) -> str:
+    query = urllib.parse.quote_plus(compact_text(f"{vendor} {model}"))
+    vendor_key = compact_text(vendor).lower()
+    if "forti" in vendor_key:
+        return f"https://docs.fortinet.com/search?q={query}"
+    if "cisco" in vendor_key:
+        return f"https://www.cisco.com/c/en/us/search.html#q={query}"
+    if "allied" in vendor_key:
+        return f"https://www.alliedtelesis.com/us/en/search?search={query}"
+    if "extreme" in vendor_key or "avaya" in vendor_key:
+        return f"https://www.extremenetworks.com/search/?q={query}"
+    return ""
+
+
+def infer_version_from_snmp(sys_descr: str) -> str:
+    text = compact_text(sys_descr)
+    patterns = [
+        r"Version\s+([0-9A-Za-z.\-]+)",
+        r"SW:v([0-9A-Za-z.\-]+)",
+        r"FW:\s*([0-9A-Za-z.\-]+)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            value = compact_text(match.group(1))
+            duplicate = re.match(r"^([0-9]+(?:\.[0-9A-Za-z]+)+)-\1(?:\b|$)", value)
+            if duplicate:
+                return duplicate.group(1)
+            return value
+    return ""
+
+
+def infer_os_name_from_snmp(sys_descr: str, vendor: str) -> str:
+    text = compact_text(sys_descr)
+    lowered = text.lower()
+    if "arubaos" in lowered:
+        return "ArubaOS"
+    if "ios software" in lowered or "ios xe" in lowered:
+        return "Cisco IOS XE"
+    if "fortios" in lowered:
+        return "FortiOS"
+    return compact_text(vendor)
+
+
+async def build_netbox_snmp_probe(payload: NetBoxSnmpProbePayload) -> dict[str, Any]:
+    sys_name = snmp_probe_value(payload, ".1.3.6.1.2.1.1.5.0")
+    sys_descr = snmp_probe_value(payload, ".1.3.6.1.2.1.1.1.0")
+    sys_location = snmp_probe_value(payload, ".1.3.6.1.2.1.1.6.0")
+    sys_object_id = snmp_probe_value(payload, ".1.3.6.1.2.1.1.2.0")
+    serial = snmp_probe_value(payload, ".1.3.6.1.2.1.47.1.1.1.1.11.1", walk=True)
+    vendor = infer_vendor_from_snmp(sys_descr, sys_object_id)
+    model = infer_model_from_snmp(sys_descr)
+    inferred_version = infer_version_from_snmp(sys_descr)
+    inferred_os_name = infer_os_name_from_snmp(sys_descr, vendor)
+    existing_observium = await observium_find_device_by_identity(sys_name or model, payload.ip)
+    existing_zabbix = await zabbix_find_host_by_identity(sys_name or model, payload.ip)
+    existing_netbox = await netbox_find_device_by_identity(sys_name or model, payload.ip)
+    device_type_match = await netbox_find_device_type_by_model(model)
+    if not serial:
+        serial = (
+            compact_text((existing_observium or {}).get("serial"))
+            or compact_text(((existing_zabbix or {}).get("inventory") or {}).get("serialno_a"))
+            or compact_text((existing_netbox or {}).get("serial"))
+        )
+    platform_label = build_os_version_label(
+        (existing_observium or {}).get("os") or inferred_os_name,
+        compact_text((existing_observium or {}).get("version")) or inferred_version,
+    )
+    description = build_os_version_label(
+        (existing_observium or {}).get("os") or inferred_os_name,
+        compact_text((existing_observium or {}).get("version")) or inferred_version,
+    )
+    return {
+        "input": payload.dict(),
+        "extracted": {
+            "sysName": sys_name,
+            "sysDescr": sys_descr,
+            "sysObjectID": sys_object_id,
+            "location": sys_location,
+            "vendor": vendor,
+            "model": model,
+            "serial": serial,
+            "ip": payload.ip,
+        },
+        "matches": {
+            "netbox": existing_netbox,
+            "zabbix": existing_zabbix,
+            "observium": existing_observium,
+            "device_type": device_type_match,
+        },
+        "official_reference_url": official_reference_url(vendor, model),
+        "proposed_netbox_fields": {
+            "name": sys_name or model or payload.ip,
+            "site": payload.site_id,
+            "role": payload.role_id,
+            "device_type": device_type_match.get("id") if device_type_match else None,
+            "serial": serial,
+            "description": description,
+            "primary_ip4": normalize_ip_value(payload.ip),
+            "platform_label": platform_label,
+            "location": sys_location,
+        },
+    }
+
+
+async def import_netbox_device_from_snmp(body: NetBoxSnmpImportPayload) -> dict[str, Any]:
+    probe = await build_netbox_snmp_probe(body)
+    proposed = probe["proposed_netbox_fields"]
+    if not body.site_id or not body.role_id:
+        raise HTTPException(400, "site_id and role_id are required")
+    device_type_id = as_int(body.device_type_id or proposed.get("device_type"))
+    ensured_device_type = None
+    if not device_type_id:
+        extracted = probe.get("extracted") or {}
+        ensured_device_type = await ensure_netbox_device_type(
+            compact_text(extracted.get("model")) or compact_text(body.name) or "Unknown Model",
+            compact_text(extracted.get("vendor")) or "Unknown Vendor",
+        )
+        device_type = ensured_device_type.get("device_type") or {}
+        device_type_id = as_int(device_type.get("id"))
+    if not device_type_id:
+        raise HTTPException(400, "A NetBox device type could not be resolved or created")
+    payload = {
+        "name": compact_text(body.name or proposed.get("name") or body.ip),
+        "status": "active",
+        "site": int(body.site_id),
+        "role": int(body.role_id),
+        "device_type": int(device_type_id),
+        "serial": compact_text(body.serial or proposed.get("serial")),
+        "description": compact_text(body.description or proposed.get("description")),
+    }
+    created = await netbox_request("POST", "/dcim/devices/", payload)
+    created_device = created.get("result") or created.get("response") or {}
+    if proposed.get("platform_label"):
+        ensured_platform = await ensure_netbox_platform(proposed["platform_label"])
+        platform = ensured_platform.get("platform") or {}
+        if platform.get("id"):
+            await netbox_request("PATCH", f"/dcim/devices/{int(created_device['id'])}/", {"platform": int(platform["id"])})
+    if proposed.get("location") and body.site_id:
+        try:
+            ensured_location = await ensure_netbox_location(proposed["location"], int(body.site_id))
+            location = ensured_location.get("location") or {}
+            if location.get("id"):
+                await netbox_request("PATCH", f"/dcim/devices/{int(created_device['id'])}/", {"location": int(location["id"])})
+        except HTTPException:
+            pass
+    if proposed.get("primary_ip4"):
+        await ensure_netbox_primary_ip4(created_device, proposed["primary_ip4"])
+    refreshed = await netbox_request("GET", f"/dcim/devices/{int(created_device['id'])}/")
+    refreshed_device = refreshed.get("result") or refreshed.get("response") or created_device
+    return {"device": refreshed_device, "probe": probe, "payload": payload, "device_type": device_type_id, "auto_created_device_type": ensured_device_type}
 
 
 async def build_netbox_enrichment(device_id: int) -> dict[str, Any]:
@@ -1958,7 +3936,25 @@ async def netbox_create_interface(body: dict[str, Any]):
 
 @app.patch("/api/netbox/interfaces/{iface_id}")
 async def netbox_update_interface(iface_id: int, body: dict[str, Any]):
-    return await netbox_request("PATCH", f"/dcim/interfaces/{iface_id}/", body)
+    payload = dict(body)
+    mac_address = parse_mac_address(payload.pop("mac_address", ""))
+    result = None
+    if payload:
+        result = await netbox_request("PATCH", f"/dcim/interfaces/{iface_id}/", payload)
+    if mac_address:
+        mac_result = await ensure_netbox_interface_mac(iface_id, mac_address)
+        detail = await netbox_request("GET", f"/dcim/interfaces/{iface_id}/")
+        return {
+            "status": "ok",
+            "request": result.get("request") if result else None,
+            "response": detail.get("response") if detail else None,
+            "result": detail.get("result") or detail.get("response") or {},
+            "mac_result": mac_result,
+        }
+    if result is not None:
+        return result
+    detail = await netbox_request("GET", f"/dcim/interfaces/{iface_id}/")
+    return {"status": "ok", "result": detail.get("result") or detail.get("response") or {}}
 
 
 @app.delete("/api/netbox/interfaces/{iface_id}")
@@ -2043,6 +4039,40 @@ async def netbox_update_sync_profile(device_id: int, body: NetBoxSyncProfilePayl
 @app.post("/api/netbox/devices/{device_id}/sync/run")
 async def netbox_run_sync(device_id: int, body: NetBoxSyncProfilePayload):
     return {"status": "ok", "result": await apply_netbox_sync(device_id, body.enabled, body.field_sources)}
+
+
+@app.get("/api/netbox/devices/{device_id}/interface-sync")
+async def netbox_device_interface_sync(device_id: int):
+    return {"status": "ok", "result": await build_netbox_interface_sync_preview(device_id)}
+
+
+@app.post("/api/netbox/devices/{device_id}/interface-sync/run")
+async def netbox_run_interface_sync(device_id: int, body: NetBoxInterfaceSyncRunPayload):
+    lock = interface_sync_lock(device_id)
+    if lock.locked():
+        raise HTTPException(409, "A NetBox interface sync is already running for this device")
+    async with lock:
+        return {"status": "ok", "result": await apply_netbox_interface_sync(device_id, body)}
+
+
+@app.post("/api/discovery/lldp/preview")
+async def discovery_lldp_preview(body: DiscoveryLldpPreviewPayload):
+    return {"status": "ok", "result": await build_lldp_discovery_preview(body)}
+
+
+@app.post("/api/discovery/lldp/apply")
+async def discovery_lldp_apply(body: DiscoveryLldpApplyPayload):
+    return {"status": "ok", "result": await apply_lldp_discovery(body)}
+
+
+@app.post("/api/netbox/snmp-discovery/preview")
+async def netbox_snmp_discovery_preview(body: NetBoxSnmpProbePayload):
+    return {"status": "ok", "result": await build_netbox_snmp_probe(body)}
+
+
+@app.post("/api/netbox/snmp-discovery/import")
+async def netbox_snmp_discovery_import(body: NetBoxSnmpImportPayload):
+    return {"status": "ok", "result": await import_netbox_device_from_snmp(body)}
 
 
 @app.get("/api/netbox/devices/{device_id}/enrichment")
@@ -2194,6 +4224,22 @@ async def observium_device(device_id: int):
     result = normalize_observium_device(row)
     result["archived"] = archive_status("observium", str(device_id))
     return {"result": result}
+
+
+@app.get("/api/observium/devices/{device_id}/ports")
+async def observium_device_ports(device_id: int):
+    row = observium_db_query(
+        """
+        SELECT *
+        FROM devices
+        WHERE device_id = %s
+        """,
+        (device_id,),
+        fetch="one",
+    )
+    if not row:
+        raise HTTPException(404, "Observium device not found")
+    return {"result": observium_port_rows(device_id)}
 
 
 @app.post("/api/observium/devices")

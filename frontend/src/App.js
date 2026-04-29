@@ -4,6 +4,7 @@ import { LogProvider } from "./hooks/useLogs";
 import { DeviceListPage } from "./pages/DeviceListPage";
 import { WorkspacePage } from "./pages/WorkspacePage";
 import { SettingsPage } from "./pages/SettingsPage";
+import { DiscoveryPage } from "./pages/DiscoveryPage";
 
 const THEME_PRESETS = {
   midnight_ops: {
@@ -174,6 +175,7 @@ function AppInner() {
         {[
           { id: "inventory", label: "⊞ Inventory" },
           { id: "workspace", label: "⊟ Workspace" },
+          { id: "discovery", label: "◎ Discovery" },
           { id: "settings", label: "⚙ Settings" },
         ].map(item => (
           <button
@@ -215,6 +217,9 @@ function AppInner() {
         </div>
         <div style={{ display: page === "workspace" ? "flex" : "none", height: "100%", flexDirection: "column" }}>
           <WorkspacePage pendingTab={page === "workspace" ? pendingTab : null} onPendingConsumed={() => setPendingTab(null)} />
+        </div>
+        <div style={{ display: page === "discovery" ? "block" : "none", height: "100%", overflow: "auto" }}>
+          <DiscoveryPage active={page === "discovery"} />
         </div>
         <div style={{ display: page === "settings" ? "block" : "none", height: "100%", overflow: "auto" }}>
           <SettingsPage uiPrefs={uiPrefs} onUiPrefsChange={setUiPrefs} themePresets={THEME_PRESETS} />

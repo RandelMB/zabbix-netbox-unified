@@ -1,6 +1,6 @@
-# ZNEditor — Zabbix ↔ NetBox Manual Editor
+# ZNEditor — Zabbix ↔ NetBox ↔ Observium Manual Editor
 
-Editor visual avanzado para gestión manual y transferencia de datos entre Zabbix y NetBox.
+Editor visual avanzado para gestión manual, correlación y sincronización controlada entre Zabbix, NetBox y Observium.
 
 ## Inicio rápido
 
@@ -60,7 +60,12 @@ zabbix-netbox-editor/
 ### 3. Editar un dispositivo
 - Clic en **Open →** en cualquier fila
 - Se abre en el **Workspace** como pestaña
-- Editar en tabs: General / Interfaces / IPs / Inventory / etc.
+- Editar en tabs: General / Ports / Sync / Raw JSON
+- **General** concentra descripción y comments
+- **Ports** unifica:
+  - asignación de IP principal a `VLAN 200` o a la interfaz de gestión elegida
+  - edición manual de puertos (`name`, `type`, `enabled`, `mac`, `description`, `ip`)
+  - sincronización completa de puertos contra Observium
 
 ### 4. Abrir múltiples en paralelo
 - Volver a Inventory y abrir otro dispositivo
@@ -75,7 +80,49 @@ zabbix-netbox-editor/
 - Revisar JSON → "Preview & Execute Transfer"
 - Confirmar en modal con JSON editable
 
-### 6. Confirmación obligatoria
+### 6. Sincronizar campos del equipo
+- Abrir un dispositivo NetBox con correlación guardada
+- Ir a **Workspace → NetBox → Sync**
+- Elegir origen por campo para:
+  - `primary_ip4`
+  - `serial`
+  - `platform`
+- Guardar perfil o ejecutar **Preview & Run Sync**
+
+### 7. Sincronizar puertos NetBox ↔ Observium
+- Abrir un dispositivo NetBox con correlación guardada hacia Observium
+- Ir a **Workspace → NetBox → Ports**
+- Usar **Refresh Interface Preview** dentro de **Observium Port Sync**
+- Revisar propuestas de:
+  - renombre de interfaz usando el nombre corto real de Observium (`port1`, `gi1/0`, `eth 1`, etc.)
+  - descripción
+  - MAC address
+  - estado administrativo
+  - tipo de interfaz
+  - MTU
+  - tags de VLAN, con visualización compacta por rangos cuando aplica (`1-1024`) y lista corta cuando son pocas VLANs
+- membresía LAG/LACP cuando Observium la expone
+- cables/conexiones cuando el vecino remoto ya puede resolverse en NetBox
+- creación directa de interfaces `unmatched_observium`
+- La ejecución del sync ahora:
+  - elimina las interfaces actuales del dispositivo en NetBox
+  - recrea los puertos desde Observium
+  - reubica la IP principal del equipo sobre `VLAN 200` o sobre la interfaz de gestión configurada
+  - serializa la ejecución por dispositivo para evitar syncs superpuestos y resultados inconsistentes
+- Ajustar los checkboxes y ejecutar **Preview & Run Port Sync**
+- El backend crea automáticamente tags `VLAN <id>` en NetBox cuando no existen
+
+### 8. Discovery
+- Ir a **Discovery** desde la navegación superior, al lado de **Workspace**
+- En **LLDP Neighbor Discovery** elegir el `Device1` desde Observium o Zabbix
+- El backend resuelve el equipo en Observium, lee vecinos LLDP/CDP, intenta resolver MAC e IP por tabla ARP y compara cada `Device2` contra NetBox, Zabbix y Observium
+- Desde esa misma vista se pueden crear en NetBox solo los vecinos seleccionados
+- En **Add Device to NetBox by SNMP** el probe consulta por IP y SNMP, extrae `sysName`, `sysDescr`, `sysObjectID`, vendor, modelo, serial y cruza coincidencias existentes
+- Si no existe `manufacturer` o `device_type` en NetBox, el import los crea automáticamente antes de registrar el equipo
+- La descripción propuesta para NetBox usa el sistema operativo junto con su versión cuando esa información está disponible
+- El flujo también se usa para altas rápidas de Access Points Aruba con IP principal, plataforma, MAC de `mgmt0`, serial y comentarios operativos
+
+### 9. Confirmación obligatoria
 - NINGÚN cambio se ejecuta sin pasar por el modal de Preview
 - El JSON es editable antes de confirmar
 - Todo queda registrado en el Log Panel
@@ -103,6 +150,14 @@ zabbix-netbox-editor/
 | GET | `/api/netbox/devices/{id}/interfaces` | Interfaces |
 | POST/PATCH/DELETE | `/api/netbox/interfaces/...` | CRUD interfaces |
 | GET/POST/PATCH/DELETE | `/api/netbox/ips/...` | CRUD IPs |
+| GET | `/api/netbox/devices/{id}/sync` | Preview del sync manual por campos |
+| POST | `/api/netbox/devices/{id}/sync/run` | Ejecutar sync manual por campos |
+| GET | `/api/netbox/devices/{id}/interface-sync` | Preview manual de puertos contra Observium |
+| POST | `/api/netbox/devices/{id}/interface-sync/run` | Reemplazar interfaces y sincronizar puertos |
+| POST | `/api/netbox/snmp-discovery/preview` | Probe SNMP por IP para alta en NetBox |
+| POST | `/api/netbox/snmp-discovery/import` | Crear dispositivo NetBox a partir del probe SNMP |
+| POST | `/api/discovery/lldp/preview` | Descubrir vecinos LLDP/CDP desde un equipo origen en Observium o Zabbix |
+| POST | `/api/discovery/lldp/apply` | Crear en NetBox los vecinos seleccionados desde Discovery |
 
 ### Configuración
 | Método | Ruta | Descripción |
