@@ -1,0 +1,13 @@
+# Cron for metadata-only Observium
+
+SHELL=/bin/sh
+PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+
+# Discovery and poller are intentionally disabled in background mode.
+# Use targeted manual discovery only:
+#   . /opt/observium/observium-setenv.sh && /opt/observium/discovery.php -h <device_id> -m os,ports,ports-stack,vlans,inventory,neighbours,ip-addresses,arp-table,mibs
+
+# Housekeeping for logs and cleanup remains enabled.
+13  5     * * *   root    . /opt/observium/observium-setenv.sh && /opt/observium/housekeeping.php -ysel >>/opt/observium/logs/cron-housekeeping-ysel.log 2>&1
+47  4     * * *   root    . /opt/observium/observium-setenv.sh && /opt/observium/housekeeping.php -yrptb >>/opt/observium/logs/cron-housekeeping-yrptb.log 2>&1
+

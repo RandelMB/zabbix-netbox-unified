@@ -12,3 +12,4 @@ inventory.drawio
 *.sqlite3
 *.swp
 backend/config/company.local.json
+.speckit/

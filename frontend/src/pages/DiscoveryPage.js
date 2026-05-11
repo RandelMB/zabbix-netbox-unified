@@ -41,6 +41,13 @@ export function DiscoveryPage({ active }) {
     snmp_version: "v2c",
     snmp_community: "",
     snmp_port: 161,
+    snmp_authlevel: "authPriv",
+    snmp_authname: "",
+    snmp_authpass: "",
+    snmp_authalgo: "SHA",
+    snmp_cryptopass: "",
+    snmp_cryptoalgo: "AES",
+    snmp_context: "",
     site_id: "",
     role_id: "",
     device_type_id: "",
@@ -165,6 +172,13 @@ export function DiscoveryPage({ active }) {
         snmp_version: snmpForm.snmp_version,
         snmp_community: snmpForm.snmp_community,
         snmp_port: Number(snmpForm.snmp_port || 161),
+        snmp_authlevel: snmpForm.snmp_authlevel,
+        snmp_authname: snmpForm.snmp_authname,
+        snmp_authpass: snmpForm.snmp_authpass,
+        snmp_authalgo: snmpForm.snmp_authalgo,
+        snmp_cryptopass: snmpForm.snmp_cryptopass,
+        snmp_cryptoalgo: snmpForm.snmp_cryptoalgo,
+        snmp_context: snmpForm.snmp_context,
         site_id: Number(snmpForm.site_id || 0),
         role_id: Number(snmpForm.role_id || 0),
       });
@@ -193,6 +207,13 @@ export function DiscoveryPage({ active }) {
         snmp_version: snmpForm.snmp_version,
         snmp_community: snmpForm.snmp_community,
         snmp_port: Number(snmpForm.snmp_port || 161),
+        snmp_authlevel: snmpForm.snmp_authlevel,
+        snmp_authname: snmpForm.snmp_authname,
+        snmp_authpass: snmpForm.snmp_authpass,
+        snmp_authalgo: snmpForm.snmp_authalgo,
+        snmp_cryptopass: snmpForm.snmp_cryptopass,
+        snmp_cryptoalgo: snmpForm.snmp_cryptoalgo,
+        snmp_context: snmpForm.snmp_context,
         site_id: Number(snmpForm.site_id || 0),
         role_id: Number(snmpForm.role_id || 0),
         device_type_id: snmpForm.device_type_id ? Number(snmpForm.device_type_id) : null,
@@ -310,10 +331,69 @@ export function DiscoveryPage({ active }) {
         <div className="section-body">
           <div className="grid-4" style={{ marginBottom: 12 }}>
             <div className="field-row"><label>IP</label><input value={snmpForm.ip} onChange={e => setSnmpField("ip", e.target.value)} placeholder="172.25.200.3" /></div>
-            <div className="field-row"><label>Community</label><input value={snmpForm.snmp_community} onChange={e => setSnmpField("snmp_community", e.target.value)} placeholder="public / RO" /></div>
+            <div className="field-row">
+              <label>SNMP Version</label>
+              <select value={snmpForm.snmp_version} onChange={e => setSnmpField("snmp_version", e.target.value)}>
+                <option value="v2c">v2c</option>
+                <option value="v3">v3</option>
+              </select>
+            </div>
+            <div className="field-row">
+              <label>{snmpForm.snmp_version === "v3" ? "Username" : "Community"}</label>
+              <input
+                type={snmpForm.snmp_version === "v3" ? "text" : "password"}
+                value={snmpForm.snmp_version === "v3" ? snmpForm.snmp_authname : snmpForm.snmp_community}
+                onChange={e => setSnmpField(snmpForm.snmp_version === "v3" ? "snmp_authname" : "snmp_community", e.target.value)}
+                placeholder={snmpForm.snmp_version === "v3" ? "snmpv3-user" : "public / RO"}
+              />
+            </div>
             <div className="field-row"><label>Site</label><select value={snmpForm.site_id} onChange={e => setSnmpField("site_id", e.target.value)}>{sites.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}</select></div>
             <div className="field-row"><label>Role</label><select value={snmpForm.role_id} onChange={e => setSnmpField("role_id", e.target.value)}>{roles.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}</select></div>
           </div>
+          {snmpForm.snmp_version === "v3" && (
+            <div className="grid-4" style={{ marginBottom: 12 }}>
+              <div className="field-row">
+                <label>Auth Level</label>
+                <select value={snmpForm.snmp_authlevel} onChange={e => setSnmpField("snmp_authlevel", e.target.value)}>
+                  <option value="noAuthNoPriv">noAuthNoPriv</option>
+                  <option value="authNoPriv">authNoPriv</option>
+                  <option value="authPriv">authPriv</option>
+                </select>
+              </div>
+              <div className="field-row">
+                <label>Auth Protocol</label>
+                <select value={snmpForm.snmp_authalgo} onChange={e => setSnmpField("snmp_authalgo", e.target.value)}>
+                  <option value="SHA">SHA</option>
+                  <option value="SHA-256">SHA-256</option>
+                  <option value="MD5">MD5</option>
+                </select>
+              </div>
+              <div className="field-row">
+                <label>Auth Password</label>
+                <input type="password" value={snmpForm.snmp_authpass} onChange={e => setSnmpField("snmp_authpass", e.target.value)} />
+              </div>
+              <div className="field-row">
+                <label>Context</label>
+                <input value={snmpForm.snmp_context} onChange={e => setSnmpField("snmp_context", e.target.value)} placeholder="optional" />
+              </div>
+              {snmpForm.snmp_authlevel === "authPriv" && (
+                <>
+                  <div className="field-row">
+                    <label>Privacy Protocol</label>
+                    <select value={snmpForm.snmp_cryptoalgo} onChange={e => setSnmpField("snmp_cryptoalgo", e.target.value)}>
+                      <option value="AES">AES</option>
+                      <option value="AES256">AES256</option>
+                      <option value="DES">DES</option>
+                    </select>
+                  </div>
+                  <div className="field-row">
+                    <label>Privacy Password</label>
+                    <input type="password" value={snmpForm.snmp_cryptopass} onChange={e => setSnmpField("snmp_cryptopass", e.target.value)} />
+                  </div>
+                </>
+              )}
+            </div>
+          )}
           <div className="flex-gap" style={{ marginBottom: 12 }}>
             <button className="btn-secondary" onClick={previewSnmp} disabled={snmpLoading}>{snmpLoading ? "Running SNMP..." : "Preview via SNMP"}</button>
           </div>

@@ -22,9 +22,12 @@ async function req(method, path, body) {
   if (body) opts.body = JSON.stringify(body);
   const r = await fetch(`${BASE}${path}`, opts);
   const data = await r.json().catch(() => ({}));
+  const requestId = r.headers.get("X-Request-ID") || "";
   if (!r.ok) {
     const message = formatErrorDetail(data.detail) || formatErrorDetail(data) || `${method} ${path} failed with status ${r.status}`;
-    throw new Error(message);
+    const error = new Error(requestId ? `${message} [request_id=${requestId}]` : message);
+    error.requestId = requestId;
+    throw error;
   }
   return data;
 }

@@ -13,6 +13,13 @@ const EMPTY_DEVICE = {
   snmp_community: "",
   snmp_port: 161,
   snmp_transport: "udp",
+  snmp_authlevel: "authPriv",
+  snmp_authname: "",
+  snmp_authpass: "",
+  snmp_authalgo: "SHA",
+  snmp_cryptopass: "",
+  snmp_cryptoalgo: "AES",
+  snmp_context: "",
   location: "",
   purpose: "",
   skip_icmp: false,
@@ -21,8 +28,29 @@ const EMPTY_DEVICE = {
 };
 
 function buildSnmpCommand(device) {
-  if (!device.hostname || !device.snmp_community) return "";
-  return `snmpget -Oqv -On -t 3 -r 1 -v ${device.snmp_version} -c '${device.snmp_community}' ${device.hostname}:${device.snmp_port || 161} 1.3.6.1.2.1.1.2.0`;
+  if (!device.hostname) return "";
+  if (device.snmp_version === "v3") {
+    if (!device.snmp_authname) return "";
+    const parts = [
+      "snmpget -Oqv -On -t 3 -r 1 -v3",
+      `-l ${device.snmp_authlevel || "authPriv"}`,
+      `-u '${device.snmp_authname}'`,
+    ];
+    if ((device.snmp_authlevel || "authPriv") !== "noAuthNoPriv") {
+      parts.push(`-a ${(device.snmp_authalgo || "SHA").toUpperCase()}`);
+      parts.push("-A '***'");
+    }
+    if ((device.snmp_authlevel || "authPriv") === "authPriv") {
+      parts.push(`-x ${(device.snmp_cryptoalgo || "AES").toUpperCase()}`);
+      parts.push("-X '***'");
+    }
+    if (device.snmp_context) parts.push(`-n '${device.snmp_context}'`);
+    parts.push(`${device.hostname}:${device.snmp_port || 161}`);
+    parts.push("1.3.6.1.2.1.1.2.0");
+    return parts.join(" ");
+  }
+  if (!device.snmp_community) return "";
+  return `snmpget -Oqv -On -t 3 -r 1 -v ${device.snmp_version} -c '***' ${device.hostname}:${device.snmp_port || 161} 1.3.6.1.2.1.1.2.0`;
 }
 
 export function ObserviumEditor({ deviceId, onDataReady }) {
@@ -71,6 +99,13 @@ export function ObserviumEditor({ deviceId, onDataReady }) {
       snmp_community: device.snmp_community,
       snmp_port: Number(device.snmp_port || 161),
       snmp_transport: device.snmp_transport,
+      snmp_authlevel: device.snmp_authlevel,
+      snmp_authname: device.snmp_authname,
+      snmp_authpass: device.snmp_authpass,
+      snmp_authalgo: device.snmp_authalgo,
+      snmp_cryptopass: device.snmp_cryptopass,
+      snmp_cryptoalgo: device.snmp_cryptoalgo,
+      snmp_context: device.snmp_context,
       location: device.location,
       purpose: device.purpose,
       skip_icmp: !!device.skip_icmp,
@@ -115,7 +150,7 @@ export function ObserviumEditor({ deviceId, onDataReady }) {
     setSaving(true);
     try {
       const response = await api.observiumRefreshDevice(device.device_id);
-      addLog("ok", `Observium poll/discovery executed: ${response.hostname}`, response);
+      addLog("ok", `Observium metadata discovery executed: ${response.hostname}`, response);
       await load();
     } catch (error) {
       addLog("err", "Observium refresh failed: " + error.message);
@@ -277,19 +312,71 @@ export function ObserviumEditor({ deviceId, onDataReady }) {
               </div>
               <div className="field-row">
                 <label>Community</label>
-                <input value={device.snmp_community || ""} onChange={e => updateField("snmp_community", e.target.value)} />
+                <input value={device.snmp_community || ""} onChange={e => updateField("snmp_community", e.target.value)} disabled={device.snmp_version === "v3"} />
               </div>
               <div className="field-row">
                 <label>Base URL</label>
                 <input value={device.web_url || ""} readOnly />
               </div>
             </div>
+            {device.snmp_version === "v3" && (
+              <div className="grid-2" style={{ marginTop: 12 }}>
+                <div className="field-row">
+                  <label>Auth Level</label>
+                  <select value={device.snmp_authlevel || "authPriv"} onChange={e => updateField("snmp_authlevel", e.target.value)}>
+                    <option value="noAuthNoPriv">noAuthNoPriv</option>
+                    <option value="authNoPriv">authNoPriv</option>
+                    <option value="authPriv">authPriv</option>
+                  </select>
+                </div>
+                <div className="field-row">
+                  <label>Username</label>
+                  <input value={device.snmp_authname || ""} onChange={e => updateField("snmp_authname", e.target.value)} />
+                </div>
+                {(device.snmp_authlevel || "authPriv") !== "noAuthNoPriv" && (
+                  <>
+                    <div className="field-row">
+                      <label>Auth Protocol</label>
+                      <select value={device.snmp_authalgo || "SHA"} onChange={e => updateField("snmp_authalgo", e.target.value)}>
+                        <option value="SHA">SHA</option>
+                        <option value="SHA-256">SHA-256</option>
+                        <option value="MD5">MD5</option>
+                      </select>
+                    </div>
+                    <div className="field-row">
+                      <label>Auth Password</label>
+                      <input type="password" value={device.snmp_authpass || ""} onChange={e => updateField("snmp_authpass", e.target.value)} />
+                    </div>
+                  </>
+                )}
+                {(device.snmp_authlevel || "authPriv") === "authPriv" && (
+                  <>
+                    <div className="field-row">
+                      <label>Privacy Protocol</label>
+                      <select value={device.snmp_cryptoalgo || "AES"} onChange={e => updateField("snmp_cryptoalgo", e.target.value)}>
+                        <option value="AES">AES</option>
+                        <option value="AES256">AES256</option>
+                        <option value="DES">DES</option>
+                      </select>
+                    </div>
+                    <div className="field-row">
+                      <label>Privacy Password</label>
+                      <input type="password" value={device.snmp_cryptopass || ""} onChange={e => updateField("snmp_cryptopass", e.target.value)} />
+                    </div>
+                  </>
+                )}
+                <div className="field-row">
+                  <label>Context</label>
+                  <input value={device.snmp_context || ""} onChange={e => updateField("snmp_context", e.target.value)} placeholder="optional" />
+                </div>
+              </div>
+            )}
 
             <div className="field-row">
               <label>Validation Command</label>
               <textarea
                 readOnly
-                value={buildSnmpCommand(device) || "Complete hostname and community to build the snmpget command."}
+                value={buildSnmpCommand(device) || "Complete hostname and SNMP credentials to build the snmpget command."}
                 style={{ height: 74, resize: "vertical", fontFamily: "var(--font-mono)" }}
               />
             </div>
@@ -316,9 +403,16 @@ export function ObserviumEditor({ deviceId, onDataReady }) {
                   snmp_community: device.snmp_community,
                   snmp_port: Number(device.snmp_port || 161),
                   snmp_transport: device.snmp_transport,
+                  snmp_authlevel: device.snmp_authlevel,
+                  snmp_authname: device.snmp_authname,
+                  snmp_authpass: device.snmp_authpass,
+                  snmp_authalgo: device.snmp_authalgo,
+                  snmp_cryptopass: device.snmp_cryptopass,
+                  snmp_cryptoalgo: device.snmp_cryptoalgo,
+                  snmp_context: device.snmp_context,
                   skip_icmp: !!device.skip_icmp,
                   run_discovery: true,
-                  run_poller: true,
+                  run_poller: false,
                 },
                 onConfirm: handleCreate,
               })}
@@ -337,7 +431,7 @@ export function ObserviumEditor({ deviceId, onDataReady }) {
               >
                 Preview & Save
               </button>
-              <button className="btn-secondary" onClick={handleRefresh} disabled={saving}>Run Poller/Discovery</button>
+              <button className="btn-secondary" onClick={handleRefresh} disabled={saving}>Run Metadata Discovery</button>
               <button className="btn-danger" onClick={handleDelete} disabled={saving}>Delete</button>
               <button className="btn-secondary" onClick={toggleArchiveSelf} disabled={saving}>{device.archived ? "Restore" : "Archive"}</button>
             </>

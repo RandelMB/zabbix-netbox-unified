@@ -1,0 +1,65 @@
+services:
+  mariadb:
+    image: mariadb:11.8
+    container_name: observium-db
+    command:
+      - mariadbd
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    environment:
+      TZ: ${TZ}
+      MYSQL_DATABASE: ${OBSERVIUM_DB_NAME}
+      MYSQL_USER: ${OBSERVIUM_DB_USER}
+      MYSQL_PASSWORD: ${OBSERVIUM_DB_PASSWORD}
+      MYSQL_ROOT_PASSWORD: ${OBSERVIUM_DB_ROOT_PASSWORD}
+    volumes:
+      - observium-db-data:/var/lib/mysql
+      - ${OBSERVIUM_SQL_DUMP}:/docker-entrypoint-initdb.d/00-observium.sql:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    networks:
+      observium:
+        aliases:
+          - mariadb
+
+  observium-app:
+    image: mbixtech/observium:latest
+    container_name: observium-app
+    depends_on:
+      mariadb:
+        condition: service_healthy
+    environment:
+      TZ: ${TZ}
+      OBSERVIUM_DB_HOST: mariadb
+      OBSERVIUM_DB_NAME: ${OBSERVIUM_DB_NAME}
+      OBSERVIUM_DB_USER: ${OBSERVIUM_DB_USER}
+      OBSERVIUM_DB_PASS: ${OBSERVIUM_DB_PASSWORD}
+      OBSERVIUM_ADMIN_USER: ${OBSERVIUM_ADMIN_USER}
+      OBSERVIUM_ADMIN_PASS: ${OBSERVIUM_ADMIN_PASS}
+      OBSERVIUM_BASE_URL: ${OBSERVIUM_BASE_URL}
+    volumes:
+      - observium-rrd:/opt/observium/rrd
+      - ./config.php:/opt/observium/config.php:ro
+      - ./cron/observium:/etc/cron.d/observium:ro
+    ports:
+      - "8666:80"
+    restart: unless-stopped
+    networks:
+      observium:
+        aliases:
+          - observium-app
+
+networks:
+  observium:
+    external: true
+    name: observium_default
+
+volumes:
+  observium-db-data:
+    name: observium-db-data
+  observium-rrd:
+    name: observium-rrd
