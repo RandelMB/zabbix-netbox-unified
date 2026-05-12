@@ -22,7 +22,7 @@ docker compose up --build
 ```
 zabbix-netbox-editor/
 ├── backend/
-│   ├── main.py              # FastAPI — composición y rutas heredadas
+│   ├── main.py              # FastAPI — bootstrap y composición mínima
 │   ├── app/                 # Nueva base modular del backend
 │   │   ├── core/            # app, settings y bootstrap
 │   │   ├── repositories/    # persistencia local
@@ -68,8 +68,8 @@ El proyecto incluye un SpecKit completo en `.speckit/` para formalizar:
 - reglas globales de arquitectura y calidad
 - integraciones con Zabbix, NetBox, Observium y SNMP
 - contratos, flows, edge cases y tareas por feature
-- estrategia de migración para sacar lógica de `backend/main.py`
-- transición incremental hacia `backend/app/` sin romper los endpoints actuales
+- estrategia de evolución incremental por bounded context
+- backend ya organizado por capas en `backend/app/`
 
 Uso recomendado:
 
@@ -113,17 +113,25 @@ La migración del backend ya dejó `backend/main.py` como bootstrap. Actualmente
 - `backend/app/routes/observium.py` encapsula CRUD Observium y export manual
 - `backend/app/services/sync_locks.py` centraliza los locks de sync
 - `backend/app/services/interface_sync.py` concentra preview/apply de sync de interfaces
-- `backend/app/services/legacy_runtime.py` contiene el runtime heredado extraído de `main.py` y consumido desde routers dedicados
+- `backend/app/services/zabbix_service.py` centraliza el bounded context de Zabbix
+- `backend/app/services/netbox_service.py` centraliza primitives CRUD de NetBox
+- `backend/app/services/netbox_sync_service.py` centraliza correlación y sync hacia NetBox
+- `backend/app/services/netbox_snmp_service.py` centraliza el runtime SNMP hacia NetBox
+- `backend/app/services/netbox_enrichment_service.py` centraliza el enrichment de NetBox
+- `backend/app/services/discovery_service.py` centraliza LLDP discovery
+- `backend/app/services/observium_service.py` centraliza CRUD/export/fallback de Observium
 - `backend/app/services/snmp_discovery.py` concentra validación, probe e import SNMP
 - `backend/app/services/settings_service.py` centraliza snapshot runtime y checks de integración
 - `backend/app/services/topology_export_service.py` centraliza export draw.io
 - `backend/app/schemas/snmp.py` define el contrato SNMP v2c/v3
-- `backend/app/schemas/` ya incluye contratos para archive, correlations y settings
+- `backend/app/schemas/` ya incluye contratos para archive, correlations, settings, netbox, observium y discovery
+- `backend/app/domain/` concentra normalización y mapeos de NetBox, Observium y Zabbix
 - `backend/app/shared/` concentra helpers puros reutilizables
 - `backend/app/shared/security.py` redacciona secretos antes de logs y respuestas
+- `backend/app/shared/networking.py` centraliza helpers IP/MAC
 - `backend/app/integrations/observium_web.py` habilita fallback de lectura por sesión web
 
-La siguiente fase debe seguir desacoplando `backend/app/services/legacy_runtime.py` internamente por bounded context, manteniendo `main.py` como entrypoint mínimo.
+`backend/main.py` ya no contiene lógica de negocio ni depende de un runtime heredado.
 
 ## Observium
 
